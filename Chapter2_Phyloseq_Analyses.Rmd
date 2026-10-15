@@ -1,0 +1,2507 @@
+---
+title: "Chapter2_Phyloseq_Analyses"
+author: "JeanneBloomberg"
+date: "5/27/2023"
+output: html_document
+---
+
+#Set up
+```{r setup, include=FALSE}
+setwd("~/Documents/WHOI/Projects/STJ_SCTLD_TS")
+```
+
+
+```{r}
+library(dplyr); packageVersion("dplyr")
+library(tidyr); packageVersion("tidyr")
+library(vegan); packageVersion("vegan")
+library(phyloseq); packageVersion("phyloseq")
+library(emmeans)
+library(ggplot2); packageVersion("ggplot2")
+library(randomcoloR)
+library(cowplot)
+library(ggplotify)
+library(readxl)
+library(gridExtra)
+library(mgcv)
+library(scales)
+
+```
+
+#Upload data
+```{r}
+load("~/Documents/WHOI/Projects/STJ_SCTLD_TS/otus_SCTSCTLDTD_J1N2V2_final.RData")
+
+taxa <- as.matrix(read.table("taxonomy_SCTSCTLDTD_J1N2V2_final.txt", sep = "\t", row.names = 1, header = TRUE))
+
+ASV_ID <-read.table("ASVsequences_SCTSCTLDTD_J1N2V2_final.txt", sep = "\t", row.names = 1, header = TRUE)
+
+metadata <- read_xlsx("meta_table.xlsx", na="NA")
+metadata <- as.data.frame(metadata)
+#plot(metadata$Tag ~ metadata$Date)
+row.names(metadata) <- metadata$Sample_names
+
+metadata_original <- metadata
+```
+
+
+#Removes <10,000 reads
+This code is for a special case. In the field, one syringe of seawater was filtered through two different filters, so the the two sequences are actually representative of one sample. I will combine the two samples into one. 
+```{r}
+#SW 32 and SW 33 are the same water sample, split between two filters
+#So I am going to combine the counts from SW-33 to SW-32
+head(otus["SW-32",])
+  # ASV1 ASV2 ASV3 ASV4 ASV5 ASV6 
+  # 882   20   79    0   59   25 
+head(otus["SW-33",])
+  # ASV1 ASV2 ASV3 ASV4 ASV5 ASV6 
+  # 99    0    0    0    0    0 
+
+otus["SW-32",] <- otus["SW-32",] + otus["SW-33",]
+head(otus["SW-32",])
+    # ASV1 ASV2 ASV3 ASV4 ASV5 ASV6 
+    # 981   20   79    0   59   25 
+    # OK I think it worked, now I have to remove sample 33 from every phyloseq with Fish Bay Seawater
+```
+
+Goal: remove samples with less than 10,000 reads
+```{r}
+
+#look at the total reads for each sample
+total_reads_per_sample <- data.frame(Sample = row.names(otus),
+                                        Reads = rowSums(otus[,]))
+keep <- rowSums(otus[,]) >= 10000
+
+removed <- rowSums(otus[,]) < 10000
+
+Samples_removed <- as.data.frame(removed[removed == TRUE])
+
+otus_noLowReads <- otus[keep,]
+
+cat(sum(removed, na.rm = TRUE), 'samples were removed because they had less than 10000 sequences.\n')
+  # 25 samples were removed because they had less than 10000 sequences.
+  # (but of these, 19 are negative controls)
+
+cat(sum(keep, na.rm = TRUE), 'samples have sufficient reads and thus, remain in the dataset.\n')
+  # 194 samples have sufficient reads and thus, remain in the dataset.
+```
+The non-control samples that are removed are: 
+Coral 11 --> losing 
+Coral 107 --> losing
+SW 33 --> this is a half sample with SW-32, so not losing a data point
+SW 34 --> this has a duplicate, so not losing a data point
+SW 42 --> this has a duplicate, so not losing a data point
+SW 9 --> losing
+
+
+#Remove duplicates
+Some of the samples have duplicates
+```{r}
+TotalReads <- as.data.frame(rowSums(otus_noLowReads[,]))
+
+#Going to remove: 
+#  Coral_52_1
+#  SW-26
+#  SW-35
+#  SW-8duplicate
+
+duplicates_toRemove <- c("Coral_52_1", "SW-26", "SW-35", "SW-8duplicate")
+
+otus_noDuplicates <- otus_noLowReads[!(rownames(otus_noLowReads) %in% duplicates_toRemove),]
+```
+
+
+Ok now I am going to cut down the meta data so that it only includes the samples I am using going forward -- i.e. without samples with low read yields and without duplicates
+
+```{r}
+otus <- otus_noDuplicates
+samples_we_use <- row.names(otus)
+ASV <- as.matrix(otus)
+
+metadata <- metadata[samples_we_use, ]
+str(metadata$Date) 
+```
+
+
+#Make base phyloseq object 
+
+```{r}
+# Make a phyloseq object. 
+ASV = otu_table(ASV, taxa_are_rows = FALSE)
+TAX = tax_table(taxa)
+META = sample_data(metadata)
+
+ps <- phyloseq(ASV, TAX, META)
+
+#remove contaminants
+load("~/Documents/WHOI/Projects/STJ_SCTLD_TS/contam.RData")
+
+ps.decontam <- prune_taxa(!contam$contaminant, ps)
+
+
+#remove ASVS that are mitochondria or chloroplasts
+ps.decontam.nomitochloro <- ps.decontam %>%
+    subset_taxa(Family !="Mitochondria" & Order !="Chloroplast")
+
+#remove ASVS with all zeros 
+ps.decontam.nozero <- filter_taxa(ps.decontam.nomitochloro, function(x) sum(x) > 0, TRUE)
+    
+#Remove the samples I don't want to use: (13 samples removed)
+    #Tag 1633 (only one sampling date; 4 additional samples)
+    #Tag bonus (only one sampling date; 2 additional samples)
+    #Tag 3979 (only one sampling date; 1 additional sample)
+    #Tag 2300 (only one sampling date; 2 additional samples)
+    #HealthState DH for coral samples (3 additional coral samples; DH ok for seawater)
+        # C-105
+        # Coral_18
+        # C-116
+ 
+ ps.decontam.filt_1 <- ps.decontam.nozero %>%
+    subset_samples(Sample_ID !="C-105" & 
+                   Sample_ID !="Coral_18" &
+                   Sample_ID !="C-116" & 
+                   Tag !="1633" & 
+                   Tag !="bonus" & 
+                   Tag !="3979" & 
+                   Tag !="2300")
+
+ Reads_per_sample_1 <- as.data.frame(sample_sums(ps.decontam.filt_1))
+ mean(Reads_per_sample_1$`sample_sums(ps.decontam.filt_1)`)  #65397.13
+ sd(Reads_per_sample_1$`sample_sums(ps.decontam.filt_1)`)  #64605.68
+ sum(Reads_per_sample_1$`sample_sums(ps.decontam.filt_1)`) #11640690
+
+```
+
+ok well now I have 14 more samples that have >10,000 reads after removing contaminants and chloro/mito. One of those samples (Coral-13) has 9933 reads, which I'll keep. But I will removed the rest. I am going to use 9000 reads as a cut off in my code, so that I keep Coral-13. 
+```{r}
+samples_over_9000 <- sample_sums(ps.decontam.filt_1) > 9000
+Samples_removed_2ndtime <- as.data.frame(samples_over_9000[samples_over_9000 == FALSE])
+
+
+ps.decontam.filt <- prune_samples(sample_sums(ps.decontam.filt_1) >= 9000, ps.decontam.filt_1) %>%
+                    subset_samples(Sample_Type != "Control") %>%   
+                    subset_samples(Sample_Type != "Mock")
+
+Reads_per_sample <- as.data.frame(sample_sums(ps.decontam.filt))
+mean(Reads_per_sample$`sample_sums(ps.decontam.filt)`)  #67415.79
+sd(Reads_per_sample$`sample_sums(ps.decontam.filt)`)  #61745.54
+sum(Reads_per_sample$`sample_sums(ps.decontam.filt)`) #10449448
+ 
+
+write.csv(Reads_per_sample, file = "Reads_per_sample.csv")
+
+MetaData_SamplesWeUse <- data.frame(sample_data(ps.decontam.filt))
+write.csv(MetaData_SamplesWeUse, file = "MetaData_SamplesWeUse.csv")
+
+
+MetaData_SamplesRemoved <- anti_join(metadata_original, MetaData_SamplesWeUse, by = "Sample_names")
+write.csv(MetaData_SamplesRemoved, file = "MetaData_SamplesRemoved.csv")
+
+```
+
+
+
+#Ordinations
+### Sample type
+```{r}
+rm(list = setdiff(ls(), c("ps.decontam.filt")))
+
+ps.SWandCoral.BothSites <- ps.decontam.filt %>%
+  transform_sample_counts(function(x) x / sum(x) ) %>%  #this makes everything in relative abundances
+  subset_samples(Sample_Type != "Control") %>%   #take out controls
+  subset_samples(Sample_Type != "Mock") %>% #take out mock
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros
+
+SWandCoral.BothSites.ord <- ordinate(ps.SWandCoral.BothSites, "PCoA", "bray",  trymax = 100, k =3, set.seed(18))
+```
+
+plot for figures
+```{r}
+plot_ordination(ps.SWandCoral.BothSites, SWandCoral.BothSites.ord, type="samples", color="Site", shape="Sample_Type") +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  guides(fill = guide_legend(title.position = "top", title.hjust = 0.5),
+         shape = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Site", shape = "Sample Type") +
+  scale_color_manual(values = c("orange3", "royalblue3"), labels = c("Coral Bay", "Fish Bay"))
+```
+
+Extract the x and y coordinates of the PCoA produced by ordinate() 
+```{r}
+# Compute percentage of variation explained
+eig_values <- SWandCoral.BothSites.ord$values$Relative_eig * 100  # Convert to percentage
+
+PCoA_df <- data.frame(SampleID = rownames(SWandCoral.BothSites.ord$vectors), 
+                      Axis1 = SWandCoral.BothSites.ord$vectors[, 1], 
+                      Axis2 = SWandCoral.BothSites.ord$vectors[, 2], 
+                      Axis3 = SWandCoral.BothSites.ord$vectors[, 3], 
+                      Site = sample_data(ps.SWandCoral.BothSites)$Site, 
+                      Date = sample_data(ps.SWandCoral.BothSites)$Date, 
+                      Tag = sample_data(ps.SWandCoral.BothSites)$Tag, 
+                      Sample_Type = sample_data(ps.SWandCoral.BothSites)$Sample_Type)
+
+PCoA_df$Days_Since_First <- as.numeric(as.Date(PCoA_df$Date) - as.Date("2020-07-16")) #number of days since the first sampling 
+str(PCoA_df$Days_Since_First) #num
+```
+
+graphical inspection --> chose axis 1
+```{r}
+plot1and2 <- ggplot(data = PCoA_df, aes(x=Axis1, y=Axis2, color=Sample_Type)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  scale_color_manual(values = c("orange3", "royalblue3"), labels = c("Coral tissue", "Near-coral seawater"))
+
+plot1and3 <- ggplot(data = PCoA_df, aes(x=Axis1, y=Axis3, color=Sample_Type)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  scale_color_manual(values = c("orange3", "royalblue3"), labels = c("Coral tissue", "Near-coral seawater"))
+
+plot2and3 <- ggplot(data = PCoA_df, aes(x=Axis2, y=Axis3, color=Sample_Type)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  scale_color_manual(values = c("orange3", "royalblue3"), labels = c("Coral tissue", "Near-coral seawater"))
+
+grid.arrange(plot1and2, plot1and3, plot2and3, nrow = 1)
+```
+
+LM with Axis 1 response (testing effect of sample type)
+```{r}
+PCoA_df$Tag <- as.factor(PCoA_df$Tag)
+str(PCoA_df$Tag)
+PCoA_df$Days_Since_First <- as.numeric(PCoA_df$Days_Since_First)
+str(PCoA_df$Days_Since_First)
+
+mod <- lm(Axis1 ~ Sample_Type + Site + Days_Since_First + Tag , data = PCoA_df) 
+summary(mod)
+confint(mod)
+```
+
+
+
+###Coral from both sites
+```{r}
+rm(list = setdiff(ls(), c("ps.decontam.filt")))
+
+ps.BothSites.Coral <- ps.decontam.filt %>%
+  transform_sample_counts(function(x) x / sum(x) ) %>%  #this makes everything in relative abundances
+  subset_samples(Sample_Type == "Coral") %>%   #subset coral samples
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros
+
+Coral.BothSites.ord <- ordinate(ps.BothSites.Coral, "PCoA", "bray",  trymax = 100, k =3, set.seed(18))
+```
+
+```{r}
+# Compute percentage of variation explained
+eig_values <- Coral.BothSites.ord$values$Relative_eig * 100  # Convert to percentage
+
+#extract the top 3 axes for graphical inspection, which I will use to determine which axes to use in my LMM
+PCoA_df <- data.frame(SampleID = rownames(Coral.BothSites.ord$vectors), 
+                      Axis1 = Coral.BothSites.ord$vectors[, 1], 
+                      Axis2 = Coral.BothSites.ord$vectors[, 2], 
+                      Axis3 = Coral.BothSites.ord$vectors[, 3], 
+                      Site = sample_data(ps.BothSites.Coral)$Site, 
+                      Date = sample_data(ps.BothSites.Coral)$Date, 
+                      Tag = sample_data(ps.BothSites.Coral)$Tag)
+
+PCoA_df$Days_Since_First <- as.numeric(as.Date(PCoA_df$Date) - as.Date("2020-07-16")) #number of days since the first sampling date
+str(PCoA_df$Days_Since_First)
+
+```
+
+Graphical inspection --> chose Axis 2 for LM
+```{r}
+#compare axes 1 and 2 --> there is some clustering along Axis2
+plot1and2 <- ggplot(data = PCoA_df, aes(x=Axis1, y=Axis2, color=Site)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Site") +
+  scale_color_manual(values = c("orange3", "royalblue3"), labels = c("Coral Bay", "Fish Bay"))
+
+#compare axes 1 and 3 --> there is some clustering along Axis3
+plot1and3 <- ggplot(data = PCoA_df, aes(x=Axis1, y=Axis3, color=Site)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Site") +
+  scale_color_manual(values = c("orange3", "royalblue3"), labels = c("Coral Bay", "Fish Bay"))
+
+#compare axes 2 and 3 --> more clustering around Axis2, so I am going to use that one for downstream analyses
+plot2and3 <- ggplot(data = PCoA_df, aes(x=Axis2, y=Axis3, color=Site)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Site") +
+  scale_color_manual(values = c("orange3", "royalblue3"), labels = c("Coral Bay", "Fish Bay"))
+
+grid.arrange(plot1and2, plot1and3, plot2and3, nrow = 1)
+```
+
+LM with Axis 2 response (coral tissue, testing effect of site)
+```{r}
+PCoA_df$Tag <- as.factor(PCoA_df$Tag)
+str(PCoA_df$Tag)
+PCoA_df$Days_Since_First <- as.numeric(PCoA_df$Days_Since_First)
+str(PCoA_df$Days_Since_First)
+#from convo with MAPB: linear regression -- with time and coral ID and site as predictors. Looking at site but adjust for time and tag and the interaction between tag and time.
+#date is in the model as days after the first sampling date of the whole experiment (2020-07-16)
+
+mod <- lm(Axis2 ~ Site + Days_Since_First + Tag + Tag*Days_Since_First, data = PCoA_df) 
+summary(mod)
+confint(mod)
+
+```
+Result: Microbial communities of coral tissue at Fish Bay and Coral Bay are significantly different (LM: β = 0.300, SE = 0.116, t = 2.585, p = 0.0135)
+
+
+
+##SW from both sites
+```{r}
+rm(list = setdiff(ls(), c("ps.decontam.filt")))
+
+ps.seawater <- ps.decontam.filt %>%
+  transform_sample_counts(function(x) x / sum(x) ) %>%  #this makes everything in relative abundances
+  subset_samples(Sample_Type == "Seawater") %>%   #subset samples
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros
+
+SW.BothSites.ord <- ordinate(ps.seawater, "PCoA", "bray",  trymax = 100, k =3, set.seed(18))
+```
+
+Extract the x and y coordinates of the PCoA produced by ordinate() 
+```{r}
+# Compute percentage of variation explained
+eig_values <- SW.BothSites.ord$values$Relative_eig * 100  # Convert to percentage
+
+#extract the top 3 axes for graphical inspection, which I will use to determine which axes to use in my LMM
+PCoA_df <- data.frame(SampleID = rownames(SW.BothSites.ord$vectors), 
+                      Axis1 = SW.BothSites.ord$vectors[, 1], 
+                      Axis2 = SW.BothSites.ord$vectors[, 2], 
+                      Axis3 = SW.BothSites.ord$vectors[, 3], 
+                      Site = sample_data(ps.seawater)$Site, 
+                      Date = sample_data(ps.seawater)$Date, 
+                      Tag = sample_data(ps.seawater)$Tag)
+
+PCoA_df$Days_Since_First <- as.numeric(as.Date(PCoA_df$Date) - as.Date("2020-07-16")) #number of days since the first sampling 
+str(PCoA_df$Days_Since_First) #num
+```
+
+Graphical inspection --> chose Axis 2 for LM
+```{r}
+#compare axes 1 and 2 --> lots of clustering along Axis2
+plot1and2 <- ggplot(data = PCoA_df, aes(x=Axis1, y=Axis2, color=Site)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Site") +
+  scale_color_manual(values = c("orange3", "royalblue3"), labels = c("Coral Bay", "Fish Bay"))
+
+#compare axes 1 and 3 --> not as much clustering
+plot1and3 <- ggplot(data = PCoA_df, aes(x=Axis1, y=Axis3, color=Site)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Site") +
+  scale_color_manual(values = c("orange3", "royalblue3"), labels = c("Coral Bay", "Fish Bay"))
+
+#compare axes 2 and 3 --> more clustering around Axis2, so I am going to use that one for downstream analyses
+plot2and3 <- ggplot(data = PCoA_df, aes(x=Axis2, y=Axis3, color=Site)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Site") +
+  scale_color_manual(values = c("orange3", "royalblue3"), labels = c("Coral Bay", "Fish Bay"))
+
+grid.arrange(plot1and2, plot1and3, plot2and3, nrow = 1)
+
+```
+
+LM with Axis 2 response (all seawater, testing effect of site)
+```{r}
+PCoA_df$Tag <- as.factor(PCoA_df$Tag)
+str(PCoA_df$Tag)
+PCoA_df$Days_Since_First <- as.numeric(PCoA_df$Days_Since_First)
+str(PCoA_df$Days_Since_First)
+
+mod <- lm(Axis2 ~ Site + Days_Since_First + Tag + Tag*Days_Since_First, data = PCoA_df) 
+summary(mod)
+confint(mod)
+
+
+```
+Result: Microbial communities of near-coral seawater at Fish Bay and Coral Bay are significantly different (LM: β = -0.231, SE = 0.068, t = -3.399, p = 0.00114). 
+
+
+
+##Coral, Fish Bay
+```{r}
+rm(list = setdiff(ls(), c("ps.decontam.filt")))
+ps.coral.Fishbay <- ps.decontam.filt %>%
+  transform_sample_counts(function(x) x / sum(x) ) %>%  #this makes everything in relative abundances
+  subset_samples(Sample_Type == "Coral") %>% #subset coral samples
+  subset_samples(Site == "Fish_Bay") %>%
+  subset_taxa(Family !="Mitochondria" & Order !="Chloroplast") %>% 
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros
+
+Coral.FishBay.ord <- ordinate(ps.coral.Fishbay, "PCoA", "bray",  trymax = 100, k =3, set.seed(18))
+```
+
+Figure 2A for plotting. Fish Bay, coral tissue x HDR. 
+```{r}
+plot2A <- plot_ordination(ps.coral.Fishbay, Coral.FishBay.ord , type="samples", color="Healthy_Diseased_Recovered") +
+  geom_point(size = 4, aes(color = factor(Healthy_Diseased_Recovered))) +
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", legend.direction ="vertical", 
+        plot.margin = unit(c(0.5, 0.5, 0, 0), "cm"),
+        plot.title = element_text(hjust = 0.5)) +
+  labs(title  = "Coral health state") +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Coral health state", tag = "A") +
+  scale_color_manual(breaks=c("Healthy", "Diseased", "Recovered"), 
+                       values = c("mediumseagreen", "darkorange2", "darkorchid3"))
+```
+
+Extract the x and y coordinates of the PCoA produced by ordinate(). Fish Bay, coral tissue x HDR. 
+```{r}
+# Compute percentage of variation explained
+eig_values <- Coral.FishBay.ord$values$Relative_eig * 100  # Convert to percentage
+
+#extract the top 3 axes for graphical inspection, which I will use to determine which axes to use in my LMM
+PCoA_df <- data.frame(SampleID = rownames(Coral.FishBay.ord$vectors), 
+                      Axis1 = Coral.FishBay.ord$vectors[, 1], 
+                      Axis2 = Coral.FishBay.ord$vectors[, 2], 
+                      Axis3 = Coral.FishBay.ord$vectors[, 3], 
+                      Site = sample_data(ps.coral.Fishbay)$Site, 
+                      Date = sample_data(ps.coral.Fishbay)$Date, 
+                      Tag = sample_data(ps.coral.Fishbay)$Tag, 
+                      HDR = sample_data(ps.coral.Fishbay)$Healthy_Diseased_Recovered)
+
+PCoA_df$Days_Since_First <- as.numeric(as.Date(PCoA_df$Date) - as.Date("2020-07-16")) #number of days since the first sampling 
+str(PCoA_df$Days_Since_First) #num
+```
+
+Graphical inspection. Fish Bay, coral tissue x HDR. chose Axis 1 for LM
+```{r}
+#compare axes 1 and 2 --> there is some clustering along Axis1, but not a ton 
+plot1and2 <- ggplot(data = PCoA_df, aes(x=Axis1, y=Axis2, color=HDR)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Coral health state") +
+  scale_color_manual(breaks=c("Healthy", "Diseased", "Recovered"), 
+                       values = c("mediumseagreen", "darkorange2", "darkorchid3"))
+
+#compare axes 1 and 3 --> not much clustering
+plot1and3 <- ggplot(data = PCoA_df, aes(x=Axis1, y=Axis3, color=HDR)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Coral health state") +
+  scale_color_manual(breaks=c("Healthy", "Diseased", "Recovered"), 
+                       values = c("mediumseagreen", "darkorange2", "darkorchid3"))
+
+#compare axes 2 and 3 --> not much clustering
+plot2and3 <- ggplot(data = PCoA_df, aes(x=Axis2, y=Axis3, color=HDR)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Coral health state") +
+  scale_color_manual(breaks=c("Healthy", "Diseased", "Recovered"), 
+                       values = c("mediumseagreen", "darkorange2", "darkorchid3"))
+
+grid.arrange(plot1and2, plot1and3, plot2and3, nrow = 1)
+```
+
+LM with Axis 1 response (Fish Bay, coral tissue, testing effect of HDR)
+```{r}
+PCoA_df$Tag <- as.factor(PCoA_df$Tag)
+str(PCoA_df$Tag)
+PCoA_df$Days_Since_First <- as.numeric(PCoA_df$Days_Since_First)
+str(PCoA_df$Days_Since_First)
+
+PCoA_df$HDR <- as.factor(PCoA_df$HDR)
+PCoA_df$HDR <- relevel(PCoA_df$HDR, ref = "Healthy")
+
+mod <- lm(Axis1 ~ HDR + Days_Since_First + Tag + Tag*Days_Since_First, data = PCoA_df) 
+summary(mod)
+confint(mod)
+
+```
+
+
+-------------------------
+
+Figure for plotting. Fish Bay, coral tissue x Date 
+Figure for plotting.  Fish Bay, coral tissue x Date, faceted by Tag
+```{r}
+sample_data(ps.coral.Fishbay)$Date <- as.Date(sample_data(ps.coral.Fishbay)$Date)
+plot2B <- plot_ordination(ps.coral.Fishbay, Coral.FishBay.ord , type="samples", color="Date") +
+  geom_point(size = 4) +
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", legend.direction ="vertical", 
+        plot.margin = unit(c(0.5, 0.5, 0, 0), "cm"),
+        plot.title = element_text(hjust = 0.5)) +
+  labs(title = "Sampling date") +
+  guides(color = guide_legend(title.position = "top",
+                              title.hjust = 0.5,
+                              ncol = 2)) +
+  labs(color = "Date", tag ="B")
+
+
+#get just the legend for plotting
+legend_2Date <- get_plot_component(plot2B, 'guide-box-bottom', return_all = TRUE)
+legend_2Date <- as_ggplot(legend_2Date)
+
+     
+plot3 <- plot_ordination(ps.coral.Fishbay, Coral.FishBay.ord , type="samples", shape ="Healthy_Diseased_Recovered", color = "Date") +
+  facet_wrap(~Tag, scale="fixed", ncol=3)  +
+  geom_point(size = 5) +
+  theme_bw() +
+  guides(color = guide_legend(title.position = "top",
+                              title.hjust = 0.5,
+                              ncol = 2)) +
+  theme(text=element_text(size=16),  
+        legend.text=element_text(size=16), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 14), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        panel.spacing = unit(0.75, "cm")) +
+  labs(color = "Date", shape = "Coral health state") + 
+  scale_shape_discrete(breaks=c("Healthy", "Diseased", "Recovered"))
+
+```
+
+Graphical inspection. Fish Bay, coral tissue x Date. chose Axis 1 for LM
+```{r}
+#compare axes 1 and 2 --> a litte bit of clustering along Axis 1 and 2
+PCoA_df$Days_Since_First <- as.factor(PCoA_df$Days_Since_First) #only do this for visualization purposes. Need to change it back to num before LM.
+
+plot1and2 <- ggplot(data = PCoA_df, aes(x=Axis1, y=Axis2, color=Days_Since_First)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  scale_color_discrete(name = "Date", breaks = PCoA_df$Days_Since_First, labels = PCoA_df$Date) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) 
+
+#compare axes 1 and 3 --> stronger clustering along Axis 1
+plot1and3 <- ggplot(data = PCoA_df, aes(x=Axis1, y=Axis3, color=Days_Since_First)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  scale_color_discrete(name = "Date", breaks = PCoA_df$Days_Since_First, labels = PCoA_df$Date) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) 
+
+#compare axes 2 and 3 --> structure a little stronger in Axis 2, but not as strong as Axis 1 in 1v3 --> so choosing Axis 1
+plot2and3 <- ggplot(data = PCoA_df, aes(x=Axis2, y=Axis3, color=Days_Since_First)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  scale_color_discrete(name = "Date", breaks = PCoA_df$Days_Since_First, labels = PCoA_df$Date) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5))
+
+grid.arrange(plot1and2, plot1and3, plot2and3, nrow = 1)
+
+```
+
+LM with Axis 1 response (Fish Bay, coral tissue, testing effect of Date)
+```{r}
+PCoA_df$Tag <- as.factor(PCoA_df$Tag)
+str(PCoA_df$Tag)
+PCoA_df$Days_Since_First <- as.numeric(PCoA_df$Days_Since_First)
+str(PCoA_df$Days_Since_First)
+
+mod <- lm(Axis1 ~ Days_Since_First + Tag, data = PCoA_df) 
+confint(mod)
+```
+Date does not have an effect on microbial communities of coral tissue (F(sub 11, 27) = 1.448, p = 0.2091).
+
+
+
+##SW, Fish Bay
+```{r}
+rm(list = setdiff(ls(), c("ps.decontam.filt")))
+
+ps.seawater.Fishbay <- ps.decontam.filt %>%
+  transform_sample_counts(function(x) x / sum(x) ) %>%  #this makes everything in relative abundances
+  subset_samples(Sample_Type == "Seawater") %>%
+  subset_samples(Site == "Fish_Bay") %>%
+  subset_taxa(Family !="Mitochondria" & Order !="Chloroplast") %>% 
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros
+
+SW.FishBay.ord <- ordinate(ps.seawater.Fishbay, "PCoA", "bray",  trymax = 200, weakties = FALSE, set.seed(18))
+```
+
+Figure for plotting. Fish Bay, seawater x HDR. 
+```{r}
+plot2C <- plot_ordination(ps.seawater.Fishbay, SW.FishBay.ord , type="samples", color="Healthy_Diseased_Recovered") +
+  geom_point(size = 4, aes(color = factor(Healthy_Diseased_Recovered))) +
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", legend.direction ="vertical", 
+        plot.margin = unit(c(0.5, 0.5, 0, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Coral health state", tag = "C") +
+  scale_color_manual(breaks=c("Healthy", "Diseased", "Recovered", "Dead"), 
+                       values = c("mediumseagreen", "darkorange2", "darkorchid3", "gray50")) 
+
+
+
+#get just the legend for plotting
+legend_2health <- get_plot_component(plot2C, 'guide-box-bottom', return_all = TRUE)
+legend_2health <- as_ggplot(legend_2health)
+```
+
+Extract the x and y coordinates of the PCoA produced by ordinate(). Fish Bay, seawater x HDR. 
+```{r}
+# Compute percentage of variation explained
+eig_values <- SW.FishBay.ord$values$Relative_eig * 100  # Convert to percentage
+
+#extract the top 3 axes for graphical inspection, which I will use to determine which axes to use in my LM
+PCoA_df <- data.frame(SampleID = rownames(SW.FishBay.ord$vectors), 
+                      Axis1 = SW.FishBay.ord$vectors[, 1], 
+                      Axis2 = SW.FishBay.ord$vectors[, 2], 
+                      Axis3 = SW.FishBay.ord$vectors[, 3], 
+                      Axis4 = SW.FishBay.ord$vectors[, 4],
+                      Site = sample_data(ps.seawater.Fishbay)$Site, 
+                      Date = sample_data(ps.seawater.Fishbay)$Date, 
+                      Tag = sample_data(ps.seawater.Fishbay)$Tag, 
+                      HDR = sample_data(ps.seawater.Fishbay)$Healthy_Diseased_Recovered)
+PCoA_df$Days_Since_First <- as.numeric(as.Date(PCoA_df$Date) - as.Date("2020-07-16")) #number of days since the first sampling 
+str(PCoA_df$Days_Since_First) #num
+```
+
+Graphical inspection. Fish Bay, seawater x HDR chose Axis 2 for LM
+```{r}
+#compare axes 1 and 2 --> there is clustering along Axis2, but Axis 1 has outliers
+plot1and2 <- ggplot(data = PCoA_df, aes(x=Axis1, y=Axis2, color=HDR)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Coral health state") +
+  scale_color_manual(breaks=c("Healthy", "Diseased", "Recovered"), 
+                       values = c("mediumseagreen", "darkorange2", "darkorchid3", "grey"))
+
+#compare axes 1 and 3 --> not much clustering along Axis3, but there are outliers driving clustering in Axis 1
+plot1and3 <- ggplot(data = PCoA_df, aes(x=Axis1, y=Axis3, color=HDR)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Coral health state") +
+  scale_color_manual(breaks=c("Healthy", "Diseased", "Recovered"), 
+                       values = c("mediumseagreen", "darkorange2", "darkorchid3", "grey"))
+
+#compare axes 2 and 3 --> more cluster along Axis 2
+plot2and3 <- ggplot(data = PCoA_df, aes(x=Axis2, y=Axis3, color=HDR)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Coral health state") +
+  scale_color_manual(breaks=c("Healthy", "Diseased", "Recovered"), 
+                       values = c("mediumseagreen", "darkorange2", "darkorchid3", "grey"))
+
+grid.arrange(plot1and2, plot1and3, plot2and3, nrow = 1)
+
+```
+
+LM with Axis 1 response (Fish Bay, seawater, testing effect of HDR)
+```{r}
+PCoA_df$Tag <- as.factor(PCoA_df$Tag)
+str(PCoA_df$Tag)
+PCoA_df$Days_Since_First <- as.numeric(PCoA_df$Days_Since_First)
+str(PCoA_df$Days_Since_First)
+
+PCoA_df$HDR <- as.factor(PCoA_df$HDR)
+PCoA_df$HDR <- relevel(PCoA_df$HDR, ref = "Healthy")
+
+mod <- lm(Axis1 ~ HDR + Days_Since_First + Tag + Tag*Days_Since_First, data = PCoA_df) 
+summary(mod)
+confint(mod)
+```
+
+
+-------------------------
+
+Figure for plotting. Fish Bay, seawater x Date 
+```{r}
+plot2D <- plot_ordination(ps.seawater.Fishbay, SW.FishBay.ord , type="samples", color="Date") +
+  geom_point(size = 4) +
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", legend.direction ="vertical", 
+        plot.margin = unit(c(0.5, 0.5, 0, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Date", tag ="D")
+
+```
+
+Graphical inspection. Fish Bay, seawater x Date. chose axis 2
+```{r}
+#compare axes 1 and 2 --> strong cluserting along axis 2
+PCoA_df$Days_Since_First <- as.factor(PCoA_df$Days_Since_First) #only do this for visualization purposes. Need to change it back to num before LM.
+plot1and2 <- ggplot(data = PCoA_df, aes(x=Axis1, y=Axis2, color=Days_Since_First)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  scale_color_discrete(name = "Date", breaks = PCoA_df$Days_Since_First, labels = PCoA_df$Date) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) 
+
+#compare axes 1 and 3 --> strong clustering along Axis 3
+plot1and3 <- ggplot(data = PCoA_df, aes(x=Axis1, y=Axis3, color=Days_Since_First)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  scale_color_discrete(name = "Date", breaks = PCoA_df$Days_Since_First, labels = PCoA_df$Date) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) 
+
+#compare axes 2 and 3 --> stronger clustering along Axis 2
+plot2and3 <- ggplot(data = PCoA_df, aes(x=Axis2, y=Axis3, color=Days_Since_First)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+   scale_color_discrete(name = "Date", breaks = PCoA_df$Days_Since_First, labels = PCoA_df$Date) +
+   guides(color = guide_legend(title.position = "top", title.hjust = 0.5))
+
+grid.arrange(plot1and2, plot1and3, plot2and3, nrow = 1)
+```
+
+LM with Axis 2 response (Fish Bay, seawater, testing effect of Date)
+```{r}
+PCoA_df$Tag <- as.factor(PCoA_df$Tag)
+str(PCoA_df$Tag)
+PCoA_df$Days_Since_First <- as.numeric(PCoA_df$Days_Since_First)
+str(PCoA_df$Days_Since_First)
+
+mod <- lm(Axis2 ~ Days_Since_First + Tag, data = PCoA_df) 
+summary(mod)
+confint(mod)
+
+```
+
+-------------------------
+I want to test if tag has an effect for relative abundance 
+
+Graphical inspection. Fish Bay, seawater x Tag chose axis 1
+```{r}
+PCoA_df$Tag <- as.factor(PCoA_df$Tag) 
+
+#compare axes 1 and 2 --> outliers
+ggplot(data = PCoA_df, aes(x=Axis1, y=Axis2, color=Tag)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) 
+
+#compare axes 1 and 3 --> outliers
+ggplot(data = PCoA_df, aes(x=Axis1, y=Axis3, color=Tag)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) 
+
+#compare axes 2 and 3 --> not much clustering
+ggplot(data = PCoA_df, aes(x=Axis2, y=Axis3, color=Tag)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) 
+
+#compare axes 2 and 4 --> not much clustering
+ggplot(data = PCoA_df, aes(x=Axis2, y=Axis4, color=Tag)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) 
+
+#compare axes 3 and 4 --> not much clustering
+ggplot(data = PCoA_df, aes(x=Axis3, y=Axis4, color=Tag)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) 
+
+
+#compare axes 1 and 4 --> outliers
+ggplot(data = PCoA_df, aes(x=Axis1, y=Axis4, color=Tag)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) 
+
+```
+
+LM with Axis 1 response (Fish Bay, seawater, testing effect of Tag)
+```{r}
+PCoA_df$Tag <- as.factor(PCoA_df$Tag)
+str(PCoA_df$Tag)
+PCoA_df$Days_Since_First <- as.numeric(PCoA_df$Days_Since_First)
+str(PCoA_df$Days_Since_First)
+
+mod <- lm(Axis2 ~ Tag + Days_Since_First + Tag*Days_Since_First, data = PCoA_df) 
+summary(mod)
+```
+Tag has an effect of microbial communities of near-coral seawater.
+
+
+
+
+
+
+
+##SW, Coral Bay
+```{r}
+rm(list = setdiff(ls(), c("ps.decontam.filt")))
+
+ps.Seawater.Coralbay <- ps.decontam.filt %>%
+  transform_sample_counts(function(x) x / sum(x) ) %>%  #this makes everything in relative abundances
+  subset_samples(Sample_Type == "Seawater") %>% #subset Seawater samples
+  subset_samples(Site == "Coral_Bay") %>%
+  subset_taxa(Family !="Mitochondria" & Order !="Chloroplast") %>% 
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros
+
+SW.CoralBay.ord <- ordinate(ps.Seawater.Coralbay, "PCoA", "bray",  trymax = 50, k =2, set.seed(18))
+```
+
+Figure for plotting. Coral Bay, seawater x Site_disease 
+```{r}
+plot1C <- plot_ordination(ps.Seawater.Coralbay, SW.CoralBay.ord , type="samples", color="Site_Disease") +
+  geom_point(size = 4, aes(color = factor(Site_Disease))) +
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", legend.direction ="vertical", 
+        plot.margin = unit(c(0.5, 0.5, 0, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Reef health state", tag = "C") +
+  scale_color_manual(breaks=c("Before", "After"), 
+                       values = c("dodgerblue3", "hotpink2"), 
+                       labels = c("Before SCTLD arrived", "After SCTLD arrived")) 
+    
+#get just the legend for plotting
+legend_ReefHealthState <- get_plot_component(plot1C, 'guide-box-bottom', return_all = TRUE)
+legend_ReefHealthState <- as_ggplot(legend_ReefHealthState)
+```
+
+Extract the x and y coordinates of the PCoA produced by ordinate(). Coral Bay, seawater x Site_disease 
+```{r}
+# Compute percentage of variation explained
+eig_values <- SW.CoralBay.ord$values$Relative_eig * 100  # Convert to percentage
+
+#extract the top 3 axes for graphical inspection, which I will use to determine which axes to use in my LM
+PCoA_df <- data.frame(SampleID = rownames(SW.CoralBay.ord$vectors), 
+                      Axis1 = SW.CoralBay.ord$vectors[, 1], 
+                      Axis2 = SW.CoralBay.ord$vectors[, 2], 
+                      Axis3 = SW.CoralBay.ord$vectors[, 3],
+                      Axis4 = SW.CoralBay.ord$vectors[, 4], 
+                      Axis5 = SW.CoralBay.ord$vectors[, 5], 
+                      Axis6 = SW.CoralBay.ord$vectors[, 6],
+                      Axis7 = SW.CoralBay.ord$vectors[, 7],
+                      Axis8 = SW.CoralBay.ord$vectors[, 8],
+                      Axis9 = SW.CoralBay.ord$vectors[, 9],
+                      Axis10 = SW.CoralBay.ord$vectors[, 10],
+                      Site = sample_data(ps.Seawater.Coralbay)$Site, 
+                      Date = sample_data(ps.Seawater.Coralbay)$Date, 
+                      Tag = sample_data(ps.Seawater.Coralbay)$Tag, 
+                      HDR = sample_data(ps.Seawater.Coralbay)$Healthy_Diseased_Recovered, 
+                      Site_Disease  = sample_data(ps.Seawater.Coralbay)$Site_Disease)
+PCoA_df$Days_Since_First <- as.numeric(as.Date(PCoA_df$Date) - as.Date("2020-07-16")) #number of days since the first sampling 
+str(PCoA_df$Days_Since_First) #num
+```
+
+Graphical inspection. Coral Bay, seawater x Site_disease chose Axis 2 for LM
+```{r}
+#compare axes 1 and 2 --> clustering on both, about the same
+plot1and2 <- ggplot(data = PCoA_df, aes(x=Axis1, y=Axis2, color=Site_Disease)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+   theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", legend.direction ="vertical", 
+        plot.margin = unit(c(0.5, 0.5, 0, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Reef health state") +
+  scale_color_manual(breaks=c("Before", "After"), 
+                       values = c("dodgerblue3", "hotpink2"), 
+                       labels = c("Before SCTLD arrived", "After SCTLD arrived")) 
+
+#compare axes 1 and 3 --> clustering on both, a little more on Axis 1
+plot1and3 <-ggplot(data = PCoA_df, aes(x=Axis1, y=Axis3, color=Site_Disease)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+   theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", legend.direction ="vertical", 
+        plot.margin = unit(c(0.5, 0.5, 0, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Reef health state") +
+  scale_color_manual(breaks=c("Before", "After"), 
+                       values = c("dodgerblue3", "hotpink2"), 
+                       labels = c("Before SCTLD arrived", "After SCTLD arrived")) 
+
+#compare axes 2 and 3 --> more cluster along Axis 2
+plot2and3 <- ggplot(data = PCoA_df, aes(x=Axis2, y=Axis3, color=Site_Disease)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+   theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", legend.direction ="vertical", 
+        plot.margin = unit(c(0.5, 0.5, 0, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Reef health state") +
+  scale_color_manual(breaks=c("Before", "After"), 
+                       values = c("dodgerblue3", "hotpink2"), 
+                       labels = c("Before SCTLD arrived", "After SCTLD arrived")) 
+
+grid.arrange(plot1and2, plot1and3, plot2and3, nrow = 1)
+```
+
+LM with Axis 2 response (Coral Bay, seawater, testing effect of Site_disease)
+```{r}
+PCoA_df$Tag <- as.factor(PCoA_df$Tag)
+str(PCoA_df$Tag)
+PCoA_df$Days_Since_First <- as.numeric(PCoA_df$Days_Since_First)
+str(PCoA_df$Days_Since_First)
+
+mod <- lm(Axis2 ~ Site_Disease + Days_Since_First + Tag + Tag*Days_Since_First, data = PCoA_df) 
+summary(mod)
+confint(mod)
+
+```
+Site_disease has an effect on the near-coral seawater at Coral Bay (F(sub 12, 32) = 2.842, p = 0.009092)
+
+-------------------------
+
+Figure 1D for plotting. Coral Bay, seawater x Date 
+```{r}
+plot1D <- plot_ordination(ps.Seawater.Coralbay, SW.CoralBay.ord , type="samples", color="Date") +
+  geom_point(size = 4) +
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0.5, 0, 0, 0.5), "cm")) +
+  guides(color = guide_legend(title.position = "top", 
+                              title.hjust = 0.5,
+                              ncol = 2)) +
+  labs(color = "Date", tag ="D")
+
+
+#get just the legend for plotting
+legend_Date1 <- get_plot_component(plot1D, 'guide-box-bottom', return_all = TRUE)
+legend_Date1 <- as_ggplot(legend_Date1)
+
+SW_CoralBay_metadata <- data.frame(sample_data(ps.Seawater.Coralbay))
+
+
+perm <- how(
+  blocks = SW_CoralBay_metadata$Tag, # Restrict permutations within each block (Tag)
+  within = Within(type = "series")  # Keep the time series structure within each plot
+)
+perm.SW.CB.date <- adonis2(distance(ps.Seawater.Coralbay, method="bray") ~ Date, 
+                           data=SW_CoralBay_metadata, 
+                          perm=perm)
+perm.SW.CB.date 
+
+```
+
+Graphical inspection. Corak Bay, seawater x Date. Chose Axis 3
+```{r}
+PCoA_df$Days_Since_First <- as.factor(PCoA_df$Days_Since_First) #only do this for visualization purposes. Need to change it back to num before LM.
+
+plot1and2 <- ggplot(data = PCoA_df, aes(x=Axis1, y=Axis2, color=Days_Since_First)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  scale_color_discrete(name = "Date", breaks = PCoA_df$Days_Since_First, labels = PCoA_df$Date) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5, ncol=2)) 
+
+plot1and3 <- ggplot(data = PCoA_df, aes(x=Axis1, y=Axis3, color=Days_Since_First)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  scale_color_discrete(name = "Date", breaks = PCoA_df$Days_Since_First, labels = PCoA_df$Date) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5, ncol=2)) 
+
+plot2and3 <- ggplot(data = PCoA_df, aes(x=Axis2, y=Axis3, color=Days_Since_First)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  scale_color_discrete(name = "Date", breaks = PCoA_df$Days_Since_First, labels = PCoA_df$Date) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5, ncol=2)) 
+
+grid.arrange(plot1and2, plot1and3, plot2and3, nrow = 1)
+
+```
+
+LM with Axis 3 response (Coral Bay, seawater, testing effect of Date)
+```{r}
+PCoA_df$Tag <- as.factor(PCoA_df$Tag)
+str(PCoA_df$Tag)
+PCoA_df$Days_Since_First <- as.numeric(PCoA_df$Days_Since_First)
+str(PCoA_df$Days_Since_First)
+
+mod <- lm(Axis3 ~ Days_Since_First + Tag , data = PCoA_df) 
+summary(mod)
+confint(mod)
+
+emms_Days_Since_First <- emmeans(mod, ~ Days_Since_First)
+emms_Days_Since_First
+
+```
+Date has an effect on the near-coral seawater at Coral Bay 
+
+
+
+
+
+##Coral, Coral Bay
+rm(list = setdiff(ls(), c("ps.decontam.filt")))
+```{r}
+ps.Coral.Coralbay <- ps.decontam.filt %>%
+  transform_sample_counts(function(x) x / sum(x) ) %>%  #this makes everything in relative abundances
+  subset_samples(Sample_Type == "Coral") %>% 
+  subset_samples(Site == "Coral_Bay") %>%
+  subset_taxa(Family !="Mitochondria" & Order !="Chloroplast") %>% 
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros
+
+Coral.CoralBay.ord <- ordinate(ps.Coral.Coralbay, "PCoA", "bray",  trymax = 50, k =2, set.seed(18))
+```
+
+Figure 1A for plotting. Coral Bay,  coral tissue x Site_Disease 
+```{r}
+plot1A <- plot_ordination(ps.Coral.Coralbay, Coral.CoralBay.ord , type="samples", color="Site_Disease") +
+  geom_point(size = 4, aes(color = factor(Site_Disease))) +
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Reef health state", tag = "A", title  = "Coral health state") +
+  scale_color_manual(breaks=c("Before", "After"), 
+                       values = c("dodgerblue3", "hotpink2"),
+                       labels = c("Before SCTLD arrived", "After SCTLD arrived"))
+```
+
+Extract the x and y coordinates of the PCoA produced by ordinate(). Coral Bay, coral tissue x Site_disease 
+```{r}
+# Compute percentage of variation explained
+eig_values <- Coral.CoralBay.ord$values$Relative_eig * 100  # Convert to percentage
+
+
+#extract the top 3 axes for graphical inspection, which I will use to determine which axes to use in my LM
+PCoA_df <- data.frame(SampleID = rownames(Coral.CoralBay.ord$vectors), 
+                      Axis1 = Coral.CoralBay.ord$vectors[, 1], 
+                      Axis2 = Coral.CoralBay.ord$vectors[, 2], 
+                      Axis3 = Coral.CoralBay.ord$vectors[, 3], 
+                      Site = sample_data(ps.Coral.Coralbay)$Site, 
+                      Date = sample_data(ps.Coral.Coralbay)$Date, 
+                      Tag = sample_data(ps.Coral.Coralbay)$Tag, 
+                      HDR = sample_data(ps.Coral.Coralbay)$Healthy_Diseased_Recovered, 
+                      Site_Disease  = sample_data(ps.Coral.Coralbay)$Site_Disease)
+PCoA_df$Days_Since_First <- as.numeric(as.Date(PCoA_df$Date) - as.Date("2020-07-16")) #number of days since the first sampling 
+str(PCoA_df$Days_Since_First) #num
+```
+
+Graphical inspection. Coral Bay, coral tissue x Site_disease chose Axis 1 for LM
+```{r}
+#compare axes 1 and 2 --> clustering on axis 1
+plot1and2 <- ggplot(data = PCoA_df, aes(x=Axis1, y=Axis2, color=Site_Disease)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+   theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", legend.direction ="vertical", 
+        plot.margin = unit(c(0.5, 0.5, 0, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Reef health state") +
+  scale_color_manual(breaks=c("Before", "After"), 
+                       values = c("dodgerblue3", "hotpink2"), 
+                       labels = c("Before SCTLD arrived", "After SCTLD arrived")) 
+
+#compare axes 1 and 3 --> clustering on axis 1
+plot1and3 <- ggplot(data = PCoA_df, aes(x=Axis1, y=Axis3, color=Site_Disease)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+   theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", legend.direction ="vertical", 
+        plot.margin = unit(c(0.5, 0.5, 0, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Reef health state") +
+  scale_color_manual(breaks=c("Before", "After"), 
+                       values = c("dodgerblue3", "hotpink2"), 
+                       labels = c("Before SCTLD arrived", "After SCTLD arrived")) 
+
+#compare axes 2 and 3 --> not much clustering. 
+plot2and3 <- ggplot(data = PCoA_df, aes(x=Axis2, y=Axis3, color=Site_Disease)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+   theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", legend.direction ="vertical", 
+        plot.margin = unit(c(0.5, 0.5, 0, 0), "cm")) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) +
+  labs(color = "Reef health state") +
+  scale_color_manual(breaks=c("Before", "After"), 
+                       values = c("dodgerblue3", "hotpink2"), 
+                       labels = c("Before SCTLD arrived", "After SCTLD arrived")) 
+
+grid.arrange(plot1and2, plot1and3, plot2and3, nrow = 1)
+
+```
+
+LM with Axis 1 response (Coral Bay, coral tissue, testing effect of Site_disease)
+```{r}
+PCoA_df$Tag <- as.factor(PCoA_df$Tag)
+str(PCoA_df$Tag)
+PCoA_df$Days_Since_First <- as.numeric(PCoA_df$Days_Since_First)
+str(PCoA_df$Days_Since_First)
+
+mod <- lm(Axis1 ~ Site_Disease + Days_Since_First + Tag + Tag*Days_Since_First, data = PCoA_df) 
+summary(mod)
+confint(mod)
+
+```
+Site_disease does not have an effect on coral tissue communities (F(sub 12, 23) = 0.8284, p = 0.6252)
+
+
+-------------------------
+
+Figure 1b for plotting. Coral Bay, tissue x Date 
+```{r}
+plot1B <- plot_ordination(ps.Coral.Coralbay, Coral.CoralBay.ord , type="samples", color="Date") +
+  geom_point(size = 4) +
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0, 0.5, 0.5), "cm")) +
+  guides(color = guide_legend(title.position = "top", 
+                              title.hjust = 0.5,
+                              ncol = 2)) +
+  labs(color = "Date", tag = "B", title  = "Sampling date")
+
+```
+
+Graphical inspection. Corak Bay, tissue x Date. Chose Axis 1.
+```{r}
+#compare axes 1 and 2 --> clustering on Axis 1
+PCoA_df$Days_Since_First <- as.factor(PCoA_df$Days_Since_First) #only do this for visualization purposes. Need to change it back to num before LM.
+plot1and2 <- ggplot(data = PCoA_df, aes(x=Axis1, y=Axis2, color=Days_Since_First)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  scale_color_discrete(name = "Date", breaks = PCoA_df$Days_Since_First, labels = PCoA_df$Date) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) 
+
+#compare axes 1 and 3 --> clustering on both, more for Axis 3
+plot1and3 <- ggplot(data = PCoA_df, aes(x=Axis1, y=Axis3, color=Days_Since_First)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  scale_color_discrete(name = "Date", breaks = PCoA_df$Days_Since_First, labels = PCoA_df$Date) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5)) 
+
+#compare axes 2 and 3 --> more on Axis 3
+plot2and3 <- ggplot(data = PCoA_df, aes(x=Axis2, y=Axis3, color=Days_Since_First)) +
+  geom_point(size = 4) +  
+  theme_bw() +
+  theme(text=element_text(size=17),  
+        legend.text=element_text(size=17), 
+        panel.grid = element_blank(), 
+        axis.text = element_text(size = 17), 
+        legend.position = "bottom", 
+        legend.direction ="vertical", 
+        plot.margin = unit(c(0, 0.5, 0.5, 0), "cm")) +
+  scale_color_discrete(name = "Date", breaks = PCoA_df$Days_Since_First, labels = PCoA_df$Date) +
+  guides(color = guide_legend(title.position = "top", title.hjust = 0.5))
+
+grid.arrange(plot1and2, plot1and3, plot2and3, nrow = 1)
+
+```
+
+LM with Axis 1 response (Coral Bay, coral tissue, testing effect of Date)
+```{r}
+PCoA_df$Tag <- as.factor(PCoA_df$Tag)
+str(PCoA_df$Tag)
+PCoA_df$Days_Since_First <- as.numeric(PCoA_df$Days_Since_First)
+str(PCoA_df$Days_Since_First)
+
+mod <- lm(Axis1 ~  Days_Since_First + Tag, data = PCoA_df) 
+summary(mod)
+
+confint(mod)
+
+```
+Date does not have an effect on coral tissue communities ((F(sub 11, 13) = 0.6034, p = 0.796))
+
+
+
+
+##put plots together for PCoA @ CB
+```{r}
+
+plot_grid(plot1A + theme(legend.position = "none"), 
+          plot1B + theme(legend.position = "none"), 
+          plot1C + theme(legend.position = "none"), 
+          plot1D + theme(legend.position = "none"), 
+          legend_ReefHealthState, 
+          legend_Date1, 
+          ncol = 2, nrow = 3)
+
+```
+
+##put plots together for PCoA @ FB
+```{r}
+
+plot_grid(plot2A + theme(legend.position = "none"), 
+          plot2B + theme(legend.position = "none"), 
+          plot2C + theme(legend.position = "none"), 
+          plot2D + theme(legend.position = "none"), 
+          legend_2health, 
+          legend_2Date, 
+          ncol = 2, nrow = 3)
+
+```
+
+
+
+#SCTLD Prevalence
+###GAM
+```{r}
+df <- read.csv("~/Documents/WHOI/Projects/STJ_SCTLD_TimeseriesExperiment/Disease Wheel Data/Prevelance_ForAnalyses.csv")
+df$Date_nice <- as.Date(df$Date) #make ggplot know it's a date
+ 
+unique(df$Date_nice)
+
+SCTLD_Prev <- df
+prev_fishbay <- subset(SCTLD_Prev, Site == "Fish_Bay")
+prev_coralbay <- subset(SCTLD_Prev, Site == "Coral_Bay")
+
+
+# GAM with successes and trials
+ggplot(df, aes(x = Date_nice,
+               y = Total_Disease_colonies / Total_AdjCorals_colonies,
+               color = Site, fill = Site)) +
+  geom_point(size = 4) +
+  geom_smooth(
+    method = "gam",
+    formula = y ~ s(as.numeric(x), k = 6), 
+    method.args = list(
+      family = binomial(link = "logit") 
+    ),
+    aes(weight = Total_AdjCorals_colonies),   
+    se = TRUE, alpha = 0.2, size = 2
+  ) +
+  scale_color_manual(values = c("Fish_Bay" = "firebrick2",
+                                "Coral_Bay" = "firebrick4")) +
+  scale_fill_manual(values = c("Fish_Bay" = "firebrick2",
+                               "Coral_Bay" = "firebrick4")) +
+  scale_y_continuous(
+    name = "SCTLD prevalence (percent)",
+    limits = c(0, 0.13),
+    labels = percent_format(accuracy = 1)
+  ) +
+  xlab("") +
+  theme_classic(base_size = 16) +
+  theme(legend.position = "none")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#Beta Diversity 
+## Means: SW from Fish Bay
+I am trying to find the mean beta diversity for either each time point, or for the epidemic vs endemic phases
+```{r}
+rm(list = setdiff(ls(), c("ps.decontam.filt", "ps.seawater.Fishbay", "ps.Seawater.Coralbay", "SCTLD_Prev", "prev_coralbay", "prev_fishbay")))
+```
+
+Start out with seawater from Fish Bay
+```{r}
+#using: ps.seawater.Fishbay
+
+otu_rel <- as.data.frame(otu_table(ps.seawater.Fishbay)) #pull out OTU table
+  otu_rel[1:3,1:3] #make sure sample names are rows
+metadat_rel <- as.data.frame(sample_data(ps.seawater.Fishbay)) #pull out Meta table
+
+#Check if my rows are in the same order
+identical(rownames(otu_rel), rownames(metadat_rel))
+
+Veg <- vegdist(otu_rel, method="bray") 
+
+Mod_BetaDisp <-betadisper(Veg, metadat_rel$Healthy_Diseased_Recovered)
+
+Mod_BetaDisp
+summary(Mod_BetaDisp)
+```
+
+Prepare for plotting
+```{r}
+dist.tab_SW_FB <- as.data.frame(Mod_BetaDisp$distances)
+dist.tab_SW_FB$Sample_names <- rownames(dist.tab_SW_FB)
+colnames(dist.tab_SW_FB)[1] <- "distance"
+
+identical(rownames(metadat_rel), dist.tab_SW_FB$Sample_names)
+    #TRUE
+
+dist.tab_SW_FB$Healthy_Diseased_Recovered <- metadat_rel$Healthy_Diseased_Recovered
+        #     table(metadat_rel$Disease_Phase)
+
+dist.tab_SW_FB$Date <- metadat_rel$Date
+dist.tab_SW_FB$Disease_Phase <- metadat_rel$Disease_Phase
+dist.tab_SW_FB$Tag <- metadat_rel$Tag
+
+
+df <- aggregate(distance ~ Disease_Phase + Healthy_Diseased_Recovered, 
+  data=dist.tab_SW_FB, 
+  function(x) { 
+    c(SD=sd(x), Mean=mean(x)) 
+})
+df_meanSD_meta <- as.data.frame(df[,1:2])
+df_meanSD <- as.data.frame(df$distance)
+df2 <- cbind(df_meanSD_meta, df_meanSD)
+
+# I am going to add a date that's in the middle of each phase. This is arbitrary and for plotting purposes. I will add  notation in Illustrator that the mean is across the entire disease phase. 
+df2$Date_forPlot <- c("2023-06-01", #Endemic
+                      "2021-06-30", #Epidemic
+                      "2023-06-01", #Endemic
+                      "2021-06-01", #Epidemic
+                      "2020-07-16", #Disease_discovered
+                      "2021-06-01", #Epidemic
+                      "2023-06-01", #Endemic
+                      "2021-05-01" #Epidemic
+                      )
+df2$Date_forPlot <- as.Date(df2$Date_forPlot) #tell R it's a date
+
+
+
+
+#Also adding Date_forPlot to dist.tab_SW_FB so that I can plot individual points as well.
+dist.tab_SW_FB <- dist.tab_SW_FB %>%
+  mutate(Date_forPlot = case_when(
+    Disease_Phase == "Disease_discovered" ~ as.Date("2020-07-16"),
+    Disease_Phase == "Epidemic" ~ case_when(
+      Healthy_Diseased_Recovered == "Dead" ~ as.Date("2021-06-30"),
+      Healthy_Diseased_Recovered == "Diseased" ~ as.Date("2021-06-01"),
+      Healthy_Diseased_Recovered == "Healthy" ~ as.Date("2021-06-01"),
+      Healthy_Diseased_Recovered == "Recovered" ~ as.Date("2021-05-01")
+    ),
+    Disease_Phase == "Endemic" ~ as.Date("2023-06-01")
+  ))
+```
+
+plotting
+
+```{r}
+ggplot() + 
+   geom_smooth(data = prev_fishbay,
+    aes(x = Date_nice, y = (Total_Disease_colonies / Total_AdjCorals_colonies), weight = Total_AdjCorals_colonies),
+    method = "gam",
+    formula = y ~ s(as.numeric(x), k = 6),
+    method.args = list(family = binomial(link = "logit")),
+    se = FALSE,
+    size = 1.6,
+    color = "firebrick2") +
+  xlab("") +
+  scale_y_continuous(name = "Distance to Centroid (colored circles)",
+    sec.axis = sec_axis(~ . * 10, name = "Percent SCTLD Prevalence (red line and red points)")) +
+  #I am manually setting the correct order of magnitude for the axes in illustrator 
+  
+  #black outline easier work around
+  geom_errorbar(data = df2,
+    aes(x = Date_forPlot, y = Mean/10,
+        ymin = Mean/10 - SD/10, ymax = Mean/10 + SD/10),
+    width = 50, size = 1.3, color = "black") + 
+  geom_errorbar(data = df2,
+    aes(x = Date_forPlot, y = Mean/10, ymin = Mean/10 - SD/10, ymax = Mean/10 + SD/10, color = Healthy_Diseased_Recovered),
+    width = 50, size = 0.75) +
+ 
+   geom_point(data = dist.tab_SW_FB,
+    aes(x = Date_forPlot, y = distance/10, fill = "black"),
+    size = 2.7) +
+  geom_point(data = dist.tab_SW_FB,
+    aes(x = Date_forPlot, y = distance/10, color = Healthy_Diseased_Recovered),
+    size = 2) + 
+
+    geom_point(data = df2,
+    aes(x = Date_forPlot, y = Mean/10, fill = "black"),
+    size = 6) +
+  geom_point(data = df2,
+    aes(x = Date_forPlot, y = Mean/10, color = Healthy_Diseased_Recovered),
+    size = 5.5) +
+  
+  theme_classic() +
+  scale_color_manual(breaks = c("Healthy", "Diseased", "Recovered", "Dead"),
+    values = c("mediumseagreen", "darkorange2", "darkorchid3", "gray50")) +
+  theme(legend.position = "none",
+    text = element_text(size = 17),
+    legend.text = element_text(size = 17),
+    panel.grid = element_blank(),
+    axis.text = element_text(size = 17))
+
+```
+
+
+significance testing for beta diversity in the different disease phases. I want to test sig dif for HDR in epidemic phases, then again for the endemic phase. Testing will need to be nested by Tag (colony ID).
+
+epidemic phase: 
+```{r}
+#using: dist.tab_SW_FB
+
+dist.tab_epidemic <- subset(dist.tab_SW_FB, Disease_Phase == "Epidemic")
+dist.tab_epidemic$Tag <- as.factor(dist.tab_epidemic$Tag)
+str(dist.tab_epidemic$Tag)
+
+dist.tab_epidemic$Healthy_Diseased_Recovered <- factor(dist.tab_epidemic$Healthy_Diseased_Recovered, 
+      levels = c("Healthy", "Diseased", "Recovered", "Dead"))
+
+#nested ANOVA with Tukey HSD
+anova_model <- aov(distance ~ Healthy_Diseased_Recovered / Tag, data = dist.tab_epidemic)
+summary(anova_model)
+  
+TukeyHSD(anova_model)
+
+```
+
+
+endemic phase:
+```{r}
+#endemic
+dist.tab_endemic <- subset(dist.tab_SW_FB, Disease_Phase == "Endemic")
+dist.tab_endemic$Tag <- as.factor(dist.tab_endemic$Tag)
+str(dist.tab_endemic$Tag)
+
+dist.tab_endemic$Healthy_Diseased_Recovered <- factor(dist.tab_endemic$Healthy_Diseased_Recovered, 
+      levels = c("Diseased", "Recovered", "Dead"))
+
+
+anova_model <- aov(distance ~ Healthy_Diseased_Recovered / Tag, data = dist.tab_endemic)
+summary(anova_model)
+ 
+```
+
+
+#Stacked Bar plots
+
+##20 most abundant AVS -- Corals from Fish Bay
+```{r}
+rm(list = setdiff(ls(), c("ps.decontam.filt", "ps.coral.Fishbay", "ps.Coral.Coralbay", "taxa")))
+
+# Subset the phyloseq object by health category
+ps_healthy <- subset_samples(ps.coral.Fishbay, Healthy_Diseased_Recovered == "Healthy")
+ps_diseased <- subset_samples(ps.coral.Fishbay, Healthy_Diseased_Recovered == "Diseased")
+ps_recovered <- subset_samples(ps.coral.Fishbay, Healthy_Diseased_Recovered == "Recovered")
+
+# Function to get top 20 ASVs based on abundance
+get_top_ASVs <- function(ps_obj, n = 20) {
+  # Aggregate ASV abundance
+  ASV_abundance <- taxa_sums(ps_obj)
+  # Sort ASVs by abundance and get top n
+  top_ASVs <- names(sort(ASV_abundance, decreasing = TRUE)[1:n])
+  return(top_ASVs)
+}
+
+# Get top 20 ASVs for each health category
+top_ASVs_healthy <- get_top_ASVs(ps_healthy)
+top_ASVs_diseased <- get_top_ASVs(ps_diseased)
+top_ASVs_recovered <- get_top_ASVs(ps_recovered)
+
+# Combine lists and remove duplicates
+combined_top_ASVs <- unique(c(top_ASVs_healthy, top_ASVs_diseased, top_ASVs_recovered))
+length(combined_top_ASVs) #53
+
+```
+
+```{r}
+# Get unique values in the specified category
+taxa_topASVs <- as.data.frame(taxa[combined_top_ASVs,])
+write.csv(taxa_topASVs, "Top_ASV_FishBay_Corals.csv")
+ 
+# Prune the phyloseq object to keep only the ASVs in combined_top_ASVs
+ps_top_ASVs <- prune_taxa(combined_top_ASVs, ps.coral.Fishbay)
+
+# Convert phyloseq object to a data frame using psmelt
+df_ps_top_ASVs <- psmelt(ps_top_ASVs)
+#see which ASVs appear the most
+df_subset <- df_ps_top_ASVs[df_ps_top_ASVs$Abundance > 0, ]
+value_counts <- table(df_subset$OTU)
+
+mean_per_sample_FB_C <- df_ps_top_ASVs %>% 
+                  group_by(Sample) %>%
+                  summarise(mean = mean(Abundance),
+                            SD = sd(Abundance),
+                            sum = sum(Abundance))
+
+total_mean_FB <- mean_per_sample_FB_C %>%
+              summarise(mean = mean(sum),
+                        SD = sd(sum))
+
+#set the colors
+n <- 53 #plug that number in here to a get that number of unique colors to plot
+set.seed(15)
+palette <- distinctColorPalette(n)
+#pie(rep(1, n), col=palette)
+
+
+# Reorder OTU levels by decreasing abundance
+df_ps_top_ASVs$OTU <- factor(df_ps_top_ASVs$OTU, levels = df_ps_top_ASVs %>%
+                          group_by(OTU) %>%
+                          summarize(TotalAbundance = sum(Abundance)) %>%
+                          arrange(desc(TotalAbundance)) %>%
+                          pull(OTU))
+
+plot <- ggplot(df_ps_top_ASVs, aes(x=Date, y=Abundance, fill=OTU)) + 
+  geom_bar(stat="identity", position="stack") + 
+  facet_grid(~Tag, scale="free") +
+  scale_fill_manual(values=palette) +
+  theme_bw() +
+  theme(text = element_text(size=16), axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  labs(title = "Top 20 ASVs from Corals from each health category from Fish Bay") +
+  xlab(" ")
+
+
+#get the plot without the legend
+plot + theme(legend.position = "none")
+
+#get the legend without the plot
+legend_topASVs <- get_legend(plot)
+legend <- as.ggplot(legend_topASVs)
+
+
+
+```
+
+
+Find the mean abundances of the taxa most consistently present: 
+ASV 22 (undescribed Blastocatellia), ASV 70 (Ruegeria), and ASV 20 (Halanaerobium)
+```{r}
+melt_ps_coral_FB <- psmelt(ps.coral.Fishbay)
+melt_ps_coral_FB <- melt_ps_coral_FB %>%
+                      filter(OTU %in% c("ASV22", "ASV70", "ASV20"))
+
+asv_stats <- melt_ps_coral_FB %>%
+  group_by(OTU) %>%
+  summarise(
+    mean_abundance = mean(Abundance, na.rm = TRUE),
+    sd_abundance   = sd(Abundance, na.rm = TRUE)) 
+
+```
+
+
+
+
+##20 most abundant AVS  -- Seawater from Fish Bay
+rm(list = setdiff(ls(), c("ps.decontam.filt", "ps.seawater.Fishbay", "ps.Seawater.Coralbay", "taxa")))
+```{r}
+# Subset the phyloseq object by health category
+ps_healthy <- subset_samples(ps.seawater.Fishbay, Healthy_Diseased_Recovered == "Healthy")
+ps_diseased <- subset_samples(ps.seawater.Fishbay, Healthy_Diseased_Recovered == "Diseased")
+ps_recovered <- subset_samples(ps.seawater.Fishbay, Healthy_Diseased_Recovered == "Recovered")
+ps_dead <- subset_samples(ps.seawater.Fishbay, Healthy_Diseased_Recovered == "Dead")
+
+# Function to get top 20 ASVs based on abundance
+get_top_ASVs <- function(ps_obj, n = 20) {
+  # Aggregate ASV abundance
+  ASV_abundance <- taxa_sums(ps_obj)
+  # Sort ASVs by abundance and get top n
+  top_ASVs <- names(sort(ASV_abundance, decreasing = TRUE)[1:n])
+  return(top_ASVs)
+}
+
+# Get top 20 ASVs for each health category
+top_ASVs_healthy <- get_top_ASVs(ps_healthy)
+top_ASVs_diseased <- get_top_ASVs(ps_diseased)
+top_ASVs_recovered <- get_top_ASVs(ps_recovered)
+top_ASVs_dead <- get_top_ASVs(ps_dead)
+
+# Combine lists and remove duplicates
+combined_top_ASVs <- unique(c(top_ASVs_healthy, top_ASVs_diseased, top_ASVs_recovered, top_ASVs_dead))
+length(combined_top_ASVs) #35
+```
+
+```{r}
+# Get unique values in the specified category
+taxa_topASVs <- as.data.frame(taxa[combined_top_ASVs,])
+write.csv(taxa_topASVs, "Top_ASV_FishBay_Seawater.csv")
+ 
+# Prune the phyloseq object to keep only the ASVs in combined_top_ASVs
+ps_top_ASVs <- prune_taxa(combined_top_ASVs, ps.seawater.Fishbay)
+
+# Convert phyloseq object to a data frame using psmelt
+df_ps_top_ASVs <- psmelt(ps_top_ASVs)
+
+df_subset <- df_ps_top_ASVs[df_ps_top_ASVs$Abundance > 0, ]
+value_counts <- table(df_subset$OTU)
+total_by_date <- subset(df_subset, OTU %in% c("ASV45", "ASV84", "ASV79", "ASV67"))
+  in1539 <- subset(total_by_date, Date == "2020-12-09" & Tag == "1539")
+  sum(in1539$Abundance) #0.620595
+  in1587 <- subset(total_by_date, Date == "2021-01-21" & Tag == "1587")
+  sum(in1587$Abundance) #0.2718574
+  in2749 <- subset(total_by_date, Date == "2021-01-06" & Tag == "2749")
+  sum(in2749$Abundance) #0.1762832
+  in2749_late <- subset(total_by_date, Date == "2023-08-02" & Tag == "2749")
+  sum(in2749_late$Abundance) #0.1762832
+
+
+mean_per_sample_FB_SW <- df_ps_top_ASVs %>% 
+                  group_by(Sample) %>%
+                  summarise(mean = mean(Abundance),
+                            SD = sd(Abundance),
+                            sum = sum(Abundance))
+
+total_mean_FB <- mean_per_sample_FB_SW %>%
+              summarise(mean = mean(sum),
+                        SD = sd(sum))
+
+
+n <- 35 #plug that number in here to a get that number of unique colors to plot
+set.seed(42) 
+palette <- distinctColorPalette(n)
+
+
+# Reorder OTU levels by decreasing abundance
+df_ps_top_ASVs$OTU <- factor(df_ps_top_ASVs$OTU, levels = df_ps_top_ASVs %>%
+                          group_by(OTU) %>%
+                          summarize(TotalAbundance = sum(Abundance)) %>%
+                          arrange(desc(TotalAbundance)) %>%
+                          pull(OTU))
+
+
+plot <- ggplot(df_ps_top_ASVs, aes(x=Date, y=Abundance, fill=OTU)) + 
+  geom_bar(stat="identity", position="stack") + 
+  facet_grid(~Tag, scale="free") +
+  scale_fill_manual(values=palette) +
+  theme_bw() +
+  theme(text = element_text(size=16), axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  labs(title = "Top 20 ASVs from Seawater from each health category from Fish Bay") +
+  xlab(" ")
+
+
+#get the plot without the legend
+plot + theme(legend.position = "none")
+
+#get the legend without the plot
+legend_topASVs <- get_legend(plot)
+legend <- as.ggplot(legend_topASVs)
+
+```
+
+
+
+
+
+##20 most abundant AVS -- Corals from Coral Bay
+```{r}
+rm(list = setdiff(ls(), c("ps.decontam.filt", "ps.Coral.Coralbay", "taxa", "mean_per_sample_FB_C")))
+
+# Subset the phyloseq object by health category
+ps_before <- subset_samples(ps.Coral.Coralbay, Site_Disease == "Before")
+ps_after <- subset_samples(ps.Coral.Coralbay, Site_Disease == "After")
+
+# Function to get top 20 ASVs based on abundance
+get_top_ASVs <- function(ps_obj, n = 20) {
+  # Aggregate ASV abundance
+  ASV_abundance <- taxa_sums(ps_obj)
+  # Sort ASVs by abundance and get top n
+  top_ASVs <- names(sort(ASV_abundance, decreasing = TRUE)[1:n])
+  return(top_ASVs)
+}
+
+# Get top 20 ASVs for each health category
+top_ASVs_before <- get_top_ASVs(ps_before)
+top_ASVs_after <- get_top_ASVs(ps_after)
+
+# Combine lists and remove duplicates
+combined_top_ASVs <- unique(c(top_ASVs_before, top_ASVs_after))
+length(combined_top_ASVs) #38
+```
+
+```{r}
+# Get unique values in the specified category
+taxa_topASVs <- as.data.frame(taxa[combined_top_ASVs,])
+write.csv(taxa_topASVs, "Top_ASV_CoralBay_Corals.csv")
+ 
+# Prune the phyloseq object to keep only the ASVs in combined_top_ASVs
+ps_top_ASVs <- prune_taxa(combined_top_ASVs, ps.Coral.Coralbay)
+
+# Convert phyloseq object to a data frame using psmelt
+df_ps_top_ASVs <- psmelt(ps_top_ASVs)
+#see which ASVs appear the most
+df_subset <- df_ps_top_ASVs[df_ps_top_ASVs$Abundance > 0, ]
+value_counts <- table(df_subset$OTU)
+
+
+mean_per_sample_CB_C <- df_ps_top_ASVs %>% 
+                  group_by(Sample) %>%
+                  summarise(mean = mean(Abundance),
+                            SD = sd(Abundance),
+                            sum = sum(Abundance))
+
+total_mean_CB <- mean_per_sample_CB_C %>%
+              summarise(mean = mean(sum),
+                        SD = sd(sum))
+
+
+n <- 38 #plug that number in here to get that number of unique colors to plot
+set.seed(15)
+palette <- distinctColorPalette(n)
+
+# Reorder OTU levels by decreasing abundance
+df_ps_top_ASVs$OTU <- factor(df_ps_top_ASVs$OTU, levels = df_ps_top_ASVs %>%
+                          group_by(OTU) %>%
+                          summarize(TotalAbundance = sum(Abundance)) %>%
+                          arrange(desc(TotalAbundance)) %>%
+                          pull(OTU))
+
+plot <- ggplot(df_ps_top_ASVs, aes(x=Date, y=Abundance, fill=OTU)) + 
+  geom_bar(stat="identity", position="stack") + 
+  facet_grid(~Tag, scale="free") +
+  scale_fill_manual(values=palette) +
+  theme_bw() +
+  theme(text = element_text(size=16), axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  labs(title = "Top 20 ASVs from Corals from each reef health cat. from Coral Bay") +
+  xlab(" ") 
+
+#get the plot without the legend
+plot + theme(legend.position = "none")
+
+#get the legend without the plot
+legend_topASVs <- get_legend(plot)
+legend <- as.ggplot(legend_topASVs)
+
+```
+
+
+
+Find the mean abundances of the taxa most consistently present: 
+ASV 23 (Synechococcus sp. CC9902), ASV 110 (unknown Desulfocapsaceae), and ASV 122 (Methyloceanibacter methanicus)
+```{r}
+melt_ps_coral_CB <- psmelt(ps.Coral.Coralbay)
+melt_ps_coral_CB <- melt_ps_coral_CB %>%
+                      filter(OTU %in% c("ASV23", "ASV110", "ASV122"))
+
+
+asv_stats <- melt_ps_coral_CB %>%
+  group_by(OTU) %>%
+  summarise(
+    mean_abundance = mean(Abundance, na.rm = TRUE),
+    sd_abundance   = sd(Abundance, na.rm = TRUE)) 
+
+```
+
+
+
+##20 most abundant AVS -- Seawater from Coral Bay
+```{r}
+rm(list = setdiff(ls(), c("ps.decontam.filt", "ps.Seawater.Coralbay", "taxa")))
+
+# Subset the phyloseq object by health category
+ps_healthy <- subset_samples(ps.Seawater.Coralbay, Healthy_Diseased_Recovered == "Healthy")
+ps_diseased <- subset_samples(ps.Seawater.Coralbay, Healthy_Diseased_Recovered == "Diseased")
+ps_dead <- subset_samples(ps.Seawater.Coralbay, Healthy_Diseased_Recovered == "Dead")
+
+# Function to get top 20 ASVs based on abundance
+get_top_ASVs <- function(ps_obj, n = 20) {
+  # Aggregate ASV abundance
+  ASV_abundance <- taxa_sums(ps_obj)
+  # Sort ASVs by abundance and get top n
+  top_ASVs <- names(sort(ASV_abundance, decreasing = TRUE)[1:n])
+  return(top_ASVs)
+}
+
+# Get top 20 ASVs for each health category
+top_ASVs_healthy <- get_top_ASVs(ps_healthy)
+top_ASVs_diseased <- get_top_ASVs(ps_diseased)
+top_ASVs_dead <- get_top_ASVs(ps_dead)
+
+# Combine lists and remove duplicates
+combined_top_ASVs <- unique(c(top_ASVs_healthy, top_ASVs_diseased, top_ASVs_dead))
+length(combined_top_ASVs) #31
+```
+
+```{r}
+# Get unique values in the specified category
+taxa_topASVs <- as.data.frame(taxa[combined_top_ASVs,])
+write.csv(taxa_topASVs, "Top_ASV_CoralBay_Seawater.csv")
+ 
+# Prune the phyloseq object to keep only the ASVs in combined_top_ASVs
+ps_top_ASVs <- prune_taxa(combined_top_ASVs, ps.Seawater.Coralbay)
+
+# Convert phyloseq object to a data frame using psmelt
+df_ps_top_ASVs <- psmelt(ps_top_ASVs)
+
+only_ASVs <- subset(df_ps_top_ASVs, OTU %in% c("ASV21", "ASV17", "ASV24"))
+mean_only_ASVs <- only_ASVs %>%
+                  group_by(OTU, Date) %>%
+                  summarise(mean = mean(Abundance),
+                            SD = sd(Abundance))
+
+mean_per_sample_CB_SW <- df_ps_top_ASVs %>% 
+                  group_by(Sample) %>%
+                  summarise(mean = mean(Abundance),
+                            SD = sd(Abundance),
+                            sum = sum(Abundance))
+
+total_mean_CB <- mean_per_sample_CB_SW %>%
+              summarise(mean = mean(sum),
+                        SD = sd(sum))
+
+
+n <- 31 #plug that number in here to get that number of unique colors to plot
+set.seed(42)
+palette <- distinctColorPalette(n)
+
+# Reorder OTU levels by decreasing abundance
+df_ps_top_ASVs$OTU <- factor(df_ps_top_ASVs$OTU, levels = df_ps_top_ASVs %>%
+                          group_by(OTU) %>%
+                          summarize(TotalAbundance = sum(Abundance)) %>%
+                          arrange(desc(TotalAbundance)) %>%
+                          pull(OTU))
+
+
+plot <- ggplot(df_ps_top_ASVs, aes(x=Date, y=Abundance, fill=OTU)) + 
+  geom_bar(stat="identity", position="stack") + 
+  facet_grid(~Tag, scale="free") +
+  scale_fill_manual(values=palette) +
+  theme_bw() +
+  theme(text = element_text(size=16), axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  labs(title = "Top 20 ASVs from Seawater from each health category from Coral Bay") +
+  xlab(" ")
+
+
+#get the plot without the legend
+plot + theme(legend.position = "none")
+
+#get the legend without the plot
+legend_topASVs <- get_legend(plot)
+legend <- as.ggplot(legend_topASVs)
+
+```
+Barplot_TopASVs_Seawater_CoralBay
+Barplot_Legend_TopASVs_Seawater_CoralBay
+
+
+##Mean abundance of key taxa
+```{r}
+# for Fish Bay
+rm(list = setdiff(ls(), c("ps.decontam.filt", "ps.seawater.Fishbay", "ps.Seawater.Coralbay", "taxa")))
+
+asv_ids <- c("ASV1", "ASV5")
+# Extract the abundance data from the phyloseq object
+otu_data <- otu_table(ps.seawater.Fishbay)
+# Ensure OTU table is in a matrix format (required for some phyloseq objects)
+if (!taxa_are_rows(ps.seawater.Fishbay)) {
+  otu_data <- t(otu_data)
+}
+# Subset the OTU table for the selected ASVs
+selected_asv_data <- otu_data[asv_ids, , drop = FALSE]
+# Calculate mean and standard deviation for each ASV across samples
+mean_abundances <- apply(selected_asv_data, 1, mean)
+sd_abundances <- apply(selected_asv_data, 1, sd)
+# Combine the results into a data frame for easier viewing
+result <- data.frame(
+  ASV = asv_ids,
+  Mean_Abundance = mean_abundances,
+  SD_Abundance = sd_abundances
+)
+
+```
+
+```{r}
+#healthy and recovered corals at Fish Bay
+rm(list = setdiff(ls(), c("ps.decontam.filt", "ps.seawater.Fishbay", "ps.Seawater.Coralbay", "taxa")))
+
+#pull out only healthy and recovered corals
+ps.SW.FB.HorR <- ps.seawater.Fishbay %>%
+  subset_samples(Healthy_Diseased_Recovered != "Dead") %>% 
+  subset_samples(Healthy_Diseased_Recovered != "Diseased")  
+
+asv_ids <- c("ASV1", "ASV5")
+
+# Extract the abundance data from the phyloseq object
+otu_data <- otu_table(ps.SW.FB.HorR)
+# Ensure OTU table is in a matrix format (required for some phyloseq objects)
+if (!taxa_are_rows(ps.SW.FB.HorR)) {
+  otu_data <- t(otu_data)
+}
+# Subset the OTU table for the selected ASVs
+selected_asv_data <- as.data.frame(t(otu_data[asv_ids, , drop = FALSE]))
+# sum the rel abun of the two taxa
+selected_asv_data$ASV_sum <- selected_asv_data$ASV1 + selected_asv_data$ASV5
+
+mean_1and5 <- mean(selected_asv_data$ASV_sum) #0.246066
+SD_1and5 <- sd(selected_asv_data$ASV_sum) #0.07664803
+# this is the mean and SD of the two most abundant pro and syn in fish bay SW amongst healthy and recovered corals. 
+```
+
+Now I want to determine which dates there are less than Mean-2*SD of ASV1 and ASV 5. 
+```{r}
+threshold <- mean_1and5 - 2*SD_1and5 #0.09276994
+
+rm(list = setdiff(ls(), c("ps.decontam.filt", "ps.seawater.Fishbay", "taxa", "threshold", "asv_ids")))
+
+#looking at all the SW FB data, not just the healthy and recovered
+
+# Extract the abundance data from the phyloseq object with all samples
+otu_data <- otu_table(ps.seawater.Fishbay)
+# Ensure OTU table is in a matrix format (required for some phyloseq objects)
+if (!taxa_are_rows(ps.seawater.Fishbay)) {
+  otu_data <- t(otu_data)
+}
+# Subset the OTU table for the selected ASVs
+selected_asv_data <- as.data.frame(t(otu_data[asv_ids, , drop = FALSE]))
+# sum the rel abun of the two taxa
+selected_asv_data$ASV_sum <- selected_asv_data$ASV1 + selected_asv_data$ASV5
+# Extract metadata
+metadata <- as.data.frame(sample_data(ps.seawater.Fishbay))
+# Merge metadata with the ASV abundance data
+selected_asv_data <- cbind(metadata, selected_asv_data)
+
+filtered_data <- selected_asv_data %>% filter(ASV_sum < threshold)
+```
+
+
+```{r}
+rm(list = setdiff(ls(), c("ps.decontam.filt", "ps.seawater.Fishbay", "taxa", "threshold", "filtered_data")))
+
+samples_LowCyano <-filtered_data$Sample_ID
+  # "Seawater_29" "Seawater_32" "Seawater_34_duplicate" "Seawater_41" 
+ps.LowCyano <- ps.seawater.Fishbay %>%
+  subset_samples(Sample_ID %in% c("Seawater_29", "Seawater_32", "Seawater_34_duplicate", "Seawater_41"))
+
+# Extract the abundance data from the phyloseq object with all samples
+otu_data <- otu_table(ps.LowCyano)
+# Ensure OTU table is in a matrix format (required for some phyloseq objects)
+if (!taxa_are_rows(ps.LowCyano)) {
+  otu_data <- t(otu_data)
+}
+otu_df <- as.data.frame(otu_data)
+
+otu_df$sum <- rowSums(otu_df, na.rm = TRUE)
+#otu_df$mean <- rowMeans(otu_df[,1:4], na.rm = TRUE)
+
+otu_df <- otu_df[order(-otu_df$sum), ]
+
+
+```
+
+
+
+
+
+
+```{r}
+# for Coral Bay
+
+rm(list = setdiff(ls(), c("ps.decontam.filt", "ps.seawater.Fishbay", "ps.Seawater.Coralbay", "taxa")))
+
+asv_ids <- c("ASV1", "ASV3")
+# Extract the abundance data from the phyloseq object
+otu_data <- otu_table(ps.Seawater.Coralbay)
+# Ensure OTU table is in a matrix format (required for some phyloseq objects)
+if (!taxa_are_rows(ps.Seawater.Coralbay)) {
+  otu_data <- t(otu_data)
+}
+# Subset the OTU table for the selected ASVs
+selected_asv_data <- otu_data[asv_ids, , drop = FALSE]
+# Calculate mean and standard deviation for each ASV across samples
+mean_abundances <- apply(selected_asv_data, 1, mean)
+sd_abundances <- apply(selected_asv_data, 1, sd)
+# Combine the results into a data frame for easier viewing
+result <- data.frame(
+  ASV = asv_ids,
+  Mean_Abundance = mean_abundances,
+  SD_Abundance = sd_abundances)
+
+```
+
+
+
+
+
+#ASVs over time
+##Z-score 
+#########Seawater and tissue from Fish Bay
+Code from Cynthia
+Z-score as a alternative to relative abundance 
+```{r}
+#clean up environment
+rm(list = setdiff(ls(), c("ps.decontam.filt", "ps.seawater.Fishbay", "ps.Seawater.Coralbay", "ps.coral.Fishbay", "ps.Coral.Coralbay")))
+
+#Seawater
+#Standardize the data using z-score standardization across abundances for all dates and samples
+df_ps.seawater.Fishbay <- psmelt(ps.seawater.Fishbay)
+df_ps.seawater.Fishbay <- df_ps.seawater.Fishbay %>%
+                      filter(OTU %in% c("ASV1", "ASV5", "ASV45", "ASV67", "ASV79", "ASV84"))
+df_seawater.Fishbay_Scales <- df_ps.seawater.Fishbay %>%
+  group_by(OTU) %>%
+  mutate(Scale_Abun = as.numeric(scale(Abundance)))
+
+
+#Tissue
+df_ps.coral.Fishbay <- psmelt(ps.coral.Fishbay)
+df_ps.coral.Fishbay <- df_ps.coral.Fishbay %>%
+                      filter(OTU %in% c("ASV1", "ASV5", "ASV45", "ASV67", "ASV79", "ASV84"))
+df_coral.Fishbay_Scales <- df_ps.coral.Fishbay %>%
+  group_by(OTU) %>%
+  mutate(Scale_Abun = as.numeric(scale(Abundance)))
+```
+
+pre-plotting set up
+```{r}
+# Set up the color gradient
+lims <- range(
+  c(df_seawater.Fishbay_Scales$Scale_Abun,
+    df_coral.Fishbay_Scales$Scale_Abun),
+  na.rm = TRUE)
+      # -2.216491  6.560548
+
+shared_fill <- scale_fill_gradientn(
+  colors = hcl.colors(256, "Spectral", rev = TRUE),
+  limits = c(-2.5, 7),        # same range for both plots
+  oob = squish,             # clamp values beyond limits so colors are comparable
+  name = "Z-score", 
+  na.value = NA #blank for NA
+)
+
+
+#set the ASVs as factors so they show up in the order I want
+desired_order <- c("ASV1", "ASV5", "ASV45", "ASV67", "ASV79", "ASV84")
+df_seawater.Fishbay_Scales <- df_seawater.Fishbay_Scales %>%
+  mutate(OTU = factor(OTU, levels = desired_order))
+df_coral.Fishbay_Scales <- df_coral.Fishbay_Scales %>%
+  mutate(OTU = factor(OTU, levels = desired_order))
+
+
+#now I need to set it up so that it puts blank rows and columns where there were no samples taken
+sw_tag_dates_FB <- df_seawater.Fishbay_Scales %>%
+  ungroup() %>%
+  select(Tag, Date) %>%
+  distinct()
+
+tis_tag_dates_Fb <- df_coral.Fishbay_Scales %>%
+  ungroup() %>%
+  select(Tag, Date) %>%
+  distinct()
+
+all_tag_dates_FB <- bind_rows(sw_tag_dates_FB, tis_tag_dates_Fb) %>%
+  distinct()
+
+grid_Fb <- tidyr::crossing(
+  all_tag_dates_FB,
+  OTU = factor(desired_order, levels = desired_order)
+)
+
+df_Seawater.FishBay_Scales_filled <- grid_Fb %>%
+  left_join(
+    df_seawater.Fishbay_Scales %>%
+      mutate(OTU = factor(OTU, levels = desired_order)) %>%
+      select(Tag, Date, OTU, Scale_Abun),
+    by = c("Tag", "Date", "OTU")
+  )
+
+df_Coral.FishBay_Scales_filled <- grid_Fb %>%
+  left_join(
+    df_coral.Fishbay_Scales %>%
+      mutate(OTU = factor(OTU, levels = desired_order)) %>%
+      select(Tag, Date, OTU, Scale_Abun),
+    by = c("Tag", "Date", "OTU")
+  )
+
+```
+
+
+heat map plotting: 
+```{r}
+#Seawater at Fish Bay
+heat_SW_FB <- ggplot(data = df_Seawater.FishBay_Scales_filled, aes(x = as.character(Date), y = OTU)) +
+  geom_tile(aes(fill = Scale_Abun), color = "black", linewidth = 0.1) +
+  facet_grid(~ Tag, scales = "free", space = "free") +
+  xlab("") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust= 1, vjust = 1)) +
+  shared_fill + #from above
+  labs(fill = "Z-score", x = "Coral ID", y = "ASV") +
+  scale_y_discrete(limits = rev(desired_order))
+
+# Tissue at Fish Bay
+heat_Tis_FB <- ggplot(data = df_Coral.FishBay_Scales_filled, aes(x = as.character(Date), y = OTU)) +
+  geom_tile(aes(fill = Scale_Abun), color = "black", linewidth = 0.1) +
+  facet_grid(~ Tag, scales = "free", space = "free") +
+  xlab("") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust= 1, vjust = 1)) +
+  shared_fill + #from above
+  labs(fill = "Z-score", x = "Coral ID", y = "ASV") +
+  scale_y_discrete(limits = rev(desired_order))
+
+plot_grid(heat_SW_FB, 
+          heat_Tis_FB, 
+          ncol = 1, nrow = 2)
+```
+
+
+
+
+
+
+#########Seawater and tissue from Coral Bay
+```{r}
+ #clean up environment
+rm(list = setdiff(ls(), c("ps.decontam.filt", "ps.seawater.Fishbay", "ps.Seawater.Coralbay", "ps.coral.Fishbay", "ps.Coral.Coralbay", "asv_abundance", "heat_SW_FB", "heat_Tis_FB", "shared_fill", "desired_order")))
+
+#Seawater
+#Standardize the data using z-score standardization across abundances for all dates and samples
+df_ps.Seawater.Coralbay <- psmelt(ps.Seawater.Coralbay)
+df_ps.Seawater.Coralbay <- df_ps.Seawater.Coralbay %>%
+                      filter(OTU %in% c("ASV1", "ASV5", "ASV45", "ASV67", "ASV79", "ASV84"))
+df_Seawater.Coralbay_Scales <- df_ps.Seawater.Coralbay %>%
+  group_by(OTU) %>%
+  mutate(Scale_Abun = as.numeric(scale(Abundance)))
+
+
+#Tissue
+df_ps.Coral.Coralbay <- psmelt(ps.Coral.Coralbay)
+df_ps.Coral.Coralbay <- df_ps.Coral.Coralbay %>%
+                      filter(OTU %in% c("ASV1", "ASV5", "ASV45", "ASV67", "ASV79", "ASV84"))
+df_Coral.Coralbay_Scales <- df_ps.Coral.Coralbay %>%
+  group_by(OTU) %>%
+  mutate(Scale_Abun = as.numeric(scale(Abundance)))
+```
+
+pre-plotting set up:
+```{r}
+#set the ASVs as factors so they show up in the order I want. 
+df_Seawater.Coralbay_Scales <- df_Seawater.Coralbay_Scales %>%
+  mutate(OTU = factor(OTU, levels = desired_order))
+df_Coral.Coralbay_Scales <- df_Coral.Coralbay_Scales %>%
+  mutate(OTU = factor(OTU, levels = desired_order))
+
+#create a master x-axis so all dates appear, regardless if they were sampled. 
+sw_tag_dates <- df_Seawater.Coralbay_Scales %>%
+  ungroup() %>%
+  select(Tag, Date) %>%
+  distinct()
+
+tis_tag_dates <- df_Coral.Coralbay_Scales %>%
+  ungroup() %>%
+  select(Tag, Date) %>%
+  distinct()
+
+all_tag_dates <- bind_rows(sw_tag_dates, tis_tag_dates) %>%
+  distinct()
+
+grid <- tidyr::crossing(
+  all_tag_dates,
+  OTU = factor(desired_order, levels = desired_order)
+)
+
+df_Seawater.Coralbay_Scales_filled <- grid %>%
+  left_join(
+    df_Seawater.Coralbay_Scales %>%
+      mutate(OTU = factor(OTU, levels = desired_order)) %>%
+      select(Tag, Date, OTU, Scale_Abun),
+    by = c("Tag", "Date", "OTU")
+  )
+
+df_Coral.Coralbay_Scales_filled <- grid %>%
+  left_join(
+    df_Coral.Coralbay_Scales %>%
+      mutate(OTU = factor(OTU, levels = desired_order)) %>%
+      select(Tag, Date, OTU, Scale_Abun),
+    by = c("Tag", "Date", "OTU")
+  )
+```
+
+heat map plotting: 
+```{r}
+#Seawater at Coral Bay
+heat_SW_FB <- ggplot(data = df_Seawater.Coralbay_Scales_filled, aes(x = as.character(Date), y = OTU)) +
+  geom_tile(aes(fill = Scale_Abun), color = "black", linewidth = 0.1) +
+  facet_grid(~ Tag, scales = "free", space = "free") +
+  xlab("") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust= 1, vjust = 1)) +
+  shared_fill + #from above
+  labs(fill = "Z-score", x = "Coral ID", y = "ASV") +
+  scale_y_discrete(limits = rev(desired_order))
+
+# Tissue at Coral Bay
+heat_Tis_FB <- ggplot(data = df_Coral.Coralbay_Scales_filled, aes(x = as.character(Date), y = OTU)) +
+  geom_tile(aes(fill = Scale_Abun), color = "black", linewidth = 0.1) +
+  facet_grid(~ Tag, scales = "free", space = "free") +
+  xlab("") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust= 1, vjust = 1)) +
+  shared_fill + #from above
+  labs(fill = "Z-score", x = "Coral ID", y = "ASV") +
+  scale_y_discrete(limits = rev(desired_order))
+
+plot_grid(heat_SW_FB, 
+          heat_Tis_FB, 
+          ncol = 1, nrow = 2)
+```
+
