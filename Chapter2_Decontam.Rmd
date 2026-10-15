@@ -1,0 +1,54 @@
+---
+title: "Chapter2_Decontam"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r}
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+BiocManager::install("decontam")
+
+library(decontam); packageVersion("decontam")
+library(ggplot2); packageVersion("ggplot2")
+library("readr")
+
+
+```
+
+```{r}
+setwd("~/STJ_SCTLD_TS_dada2")
+```
+
+
+```{r}
+load("~/STJ_SCTLD_TS_dada2/otus_SCTSCTLDTD_J1N2V2_final.RData")
+
+meta <- read.csv("meta_table_learnerror.csv", header = TRUE)
+
+taxonomy <- read.delim("~/STJ_SCTLD_TS_dada2/taxonomy_SCTSCTLDTD_J1N2V2_final.txt")
+
+ASVsequence <- read.delim("~/STJ_SCTLD_TS_dada2/ASVsequences_SCTSCTLDTD_J1N2V2_final.txt")
+
+```
+
+
+```{r}
+#How many negative controls are there?
+sum(meta$Sample_Type == "Control") 
+#27
+```
+
+
+```{r}
+contam <- isContaminant(otus, neg=meta$Sample_Type %in% "Control", method="prevalence")
+
+```
+
+```{r}
+save(contam, file="~/STJ_SCTLD_TS_dada2/contam.RData")
+
+```
+
