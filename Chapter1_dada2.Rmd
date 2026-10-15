@@ -1,0 +1,651 @@
+---
+title: "dada2_LCT_AllSamples"
+author: "JeanneBloomberg"
+date: "2025-07-17"
+output: html_document
+---
+
+#Background
+This is for the Little Cayman Transplant. Corals were collected from 10 m and 40 m, cut in half, and then cross-transplanted. I have initial samples (T0) and final samples after 6 months on the reefs (TF). The experiment was done at Martha's Finyard and at Coral City. I have coral tissue and coral mucus samples from each coral. I also have environmental water samples from a variety of reefs around Little Cayman (T0) and from the experimental sites (T0 and TF). Sequencing was done in 5 libraries, one of which used MiSeq i100 (the rest were MiSeq). I will run learnError and dada2 separately for each sample type and library ID combination, resulting in 6 streams. Because MiSeq i100 results in a much higher number of reads per sample, these samples will be rarified. 
+
+#General set up
+```{r setup, include=FALSE}
+setwd("~/Documents/WHOI/Projects/LittleCaymanTransplant_Analyses")
+```
+
+
+```{r}
+library("dada2")
+packageVersion("dada2") #need at least 1.37 for MiSeq i100
+
+library(dplyr)
+library(data.table)
+
+```
+
+
+
+Define the following path variable so that it points to the extracted directory on your machine:
+```{r}
+path <-  "~/Documents/WHOI/Projects/LittleCaymanTransplant/FastQ" 
+
+list.files(path)
+length(list.files(path)) #564 --> great, bc I have 282 samples, and 282*2=564
+length(unique(list.files(path))) #564 --> great, every file name is unique
+
+#TOTAL READS using " gzip -dc *.fastq.gz | wc -l | awk '{print $1/4}' ": 53275286 reads
+```
+
+
+
+#Set up learnError groups
+
+```{r}
+meta <- read.csv("Meta_Data.csv", header = TRUE)
+dim(meta)
+
+#Make data frames for each error rate group
+unique_runs <- sort(unique(meta$Learn_error_number))
+
+meta_1run <- meta[which(meta$Learn_error_number==unique_runs[1]),]
+nrow(meta_1run)#57 --> Coral tissue, R2 
+
+meta_2run <- meta[which(meta$Learn_error_number==unique_runs[2]),]
+nrow(meta_2run) #26 --> Water, T2
+
+meta_3run <- meta[which(meta$Learn_error_number==unique_runs[3]),]
+nrow(meta_3run) #65 --> Coral tissue, V2
+
+meta_4run <- meta[which(meta$Learn_error_number==unique_runs[4]),]
+nrow(meta_4run) #98 --> Mucus, Y2
+
+meta_5run <- meta[which(meta$Learn_error_number==unique_runs[5]),]
+nrow(meta_5run) #21 --> Water, Y2
+
+meta_6run <- meta[which(meta$Learn_error_number==unique_runs[6]),]
+nrow(meta_6run) #15 --> Mucus, Z2
+
+#make sure I have all my samples covered:
+nrow(meta_1run) + nrow(meta_2run) + nrow(meta_3run) + nrow(meta_4run) + nrow(meta_5run) + nrow(meta_6run) 
+#282, so I'm good!
+
+```
+
+Now we read in the names of the fastq files, and perform some string manipulation to get matched lists of the forward and reverse fastq files.
+
+```{r}
+# 1. List files
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq", full.names = TRUE))
+
+# 2. Extract File_Name_Header from each file
+  # Adjust this to match how your File_Name_Header appears in the filename
+  # This assumes filenames like "Water_F_2_ACGCTACT-TAGCGAGT_L001_R1_001.fastq"
+file_headers_F <- sapply(fnFs, function(x) {
+  sub("L001_R1_001.fastq.gz$", "", basename(x))
+}, USE.NAMES = FALSE)
+
+
+# 3. Match to metadata
+# Your metadata should be a data frame with File_Name_Header and Unique_ID as columns
+# Match file headers to metadata
+matched_df <- meta[match(file_headers_F, meta$File_Name_Header), ]
+
+
+# 4. Confirm everything aligns
+# Make sure all matched
+stopifnot(all(!is.na(matched_df$Unique_ID)))
+    #Error: all(!is.na(matched_df$Unique_ID)) is not TRUE
+
+# 5. if there are unmatched names, find the unmatched names
+# unmatched <- setdiff(file_headers_F, meta$File_Name_Header)
+# if (length(unmatched) > 0) {
+#   warning("Some file headers are not found in metadata:\n", paste(unmatched, collapse = "\n"))
+# }
+
+
+sample.names <- matched_df$Unique_ID
+names(fnFs) <- sample.names
+names(fnRs) <- sample.names
+
+#Save
+write.csv(sample.names, file = "sample_names.csv")
+```
+sample.names <- read.csv("sample_names.csv")
+
+
+
+#Inspect read quality profiles
+
+We start by visualizing the quality profiles of the forward reads. 
+Going to look at the profiles for each learnError group
+```{r}
+# Coral tissue, R2
+plotQualityProfile(fnFs[16:17])
+    # not a strong drop off, I'd cut off 10
+
+# Water, T2
+plotQualityProfile(fnFs[123:124])
+    # not a strong drop off, I'd cut off 10
+
+# Coral tissue, V2
+plotQualityProfile(fnFs[26:27])
+    # not a strong drop off, I'd cut off 10
+
+# Mucus, Y2
+plotQualityProfile(fnFs[213:214])
+    # not a strong drop off, I'd cut off 10
+
+# Water, Y2
+plotQualityProfile(fnFs[267:268])
+    # not a strong drop off, I'd cut off 10
+
+# Mucus, Z2
+plotQualityProfile(fnFs[146:147])
+    # no drop off, bc MiSeq i100
+
+```
+Decision: Cut of 10 based on forward reads at position 240. 
+
+
+Now we visualize the quality profile of the reverse reads:
+```{r}
+# Coral tissue, R2
+plotQualityProfile(fnRs[16:17])
+    # Cut off ~50
+
+# Water, T2
+plotQualityProfile(fnRs[123:124])
+    # Cut off ~25
+
+# Coral tissue, V2
+plotQualityProfile(fnRs[26:27])
+    # Cut off ~50
+
+# Mucus, Y2
+plotQualityProfile(fnRs[213:214])
+    # Cut off ~50
+
+# Water, Y2
+plotQualityProfile(fnRs[267:268])
+    # Cut off ~30
+
+# Mucus, Z2
+plotQualityProfile(fnRs[146:147])
+    # no drop off, bc MiSeq i100
+```
+Decision: Cut of 50 based on forward reads at position 200.
+
+
+
+#Filter and trim
+
+Assign the filenames for the filtered fastq.gz files.
+```{r}
+# Place filtered files in filtered/ subdirectory
+filtFs <- file.path(path, "filtered", paste0(meta$File_Name_Header, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(meta$File_Name_Header, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+```
+
+
+
+```{r}
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(240,200),
+              maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+              compress=TRUE, multithread=TRUE)
+
+#Save
+save(out, file="/Users/jeannebloomberg/Documents/WHOI/Projects/Little_Cayman_Transplant_Analyses/out_filterAndTrim.RData")
+```
+load("/Users/jeannebloomberg/Documents/WHOI/Projects/Little_Cayman_Transplant_Analyses/out_filterAndTrim.RData")
+
+
+
+# Learn the Error Rates
+#### Forwards
+Learn errors (F) for each sequencing run
+```{r}
+# Coral tissue, R2 (57 samples) 
+filtFs_1run <- filtFs[meta_1run$Unique_ID]
+errF_1run <- learnErrors(filtFs_1run, multithread = TRUE)
+
+# Water, T2 (26 samples)
+filtFs_2run <- filtFs[meta_2run$Unique_ID]
+errF_2run <- learnErrors(filtFs_2run, multithread = TRUE)
+
+# Coral tissue, V2 (65 samples)
+filtFs_3run <- filtFs[meta_3run$Unique_ID]
+errF_3run <- learnErrors(filtFs_3run, multithread = TRUE)
+
+# Mucus, Y2 (98 samples)
+filtFs_4run <- filtFs[meta_4run$Unique_ID]
+errF_4run <- learnErrors(filtFs_4run, multithread = TRUE)
+
+# Water, Y2 (21 samples)
+filtFs_5run <- filtFs[meta_5run$Unique_ID]
+errF_5run <- learnErrors(filtFs_5run, multithread = TRUE)
+
+# Mucus, Z2 (15)
+# Need to do this one differently, because it is MiSeq i100 that uses binned quality scores. See notes on WHOI/Projects/EEID-PREDICT-Shallowdada2_Water_Prelim.Rmd
+filtFs_6run <- filtFs[meta_6run$Unique_ID]
+binnedQs <- c(2, 12, 24, 38)
+binnedQualErrfun <- makeBinnedQualErrfun(binnedQs)
+errF_6run <-learnErrors(filtFs_6run, errorEstimationFunction=binnedQualErrfun, multi=TRUE)
+
+
+#Save
+save(errF_1run, file = "errF_1run.RData")
+save(errF_2run, file = "errF_2run.RData")
+save(errF_3run, file = "errF_3run.RData")
+save(errF_4run, file = "errF_4run.RData")
+save(errF_5run, file = "errF_5run.RData")
+save(errF_6run, file = "errF_6run.RData")
+```
+
+
+
+
+#### Reverses
+Learn errors (F) for each sequencing run
+```{r}
+# Coral tissue, R2 (57 samples) 
+filtRs_1run <- filtRs[meta_1run$Unique_ID]
+errR_1run <- learnErrors(filtRs_1run, multithread = TRUE)
+
+# Water, T2 (26 samples)
+filtRs_2run <- filtRs[meta_2run$Unique_ID]
+errR_2run <- learnErrors(filtRs_2run, multithread = TRUE)
+
+# Coral tissue, V2 (65 samples)
+filtRs_3run <- filtRs[meta_3run$Unique_ID]
+errR_3run <- learnErrors(filtRs_3run, multithread = TRUE)
+
+# Mucus, Y2 (98 samples)
+filtRs_4run <- filtRs[meta_4run$Unique_ID]
+errR_4run <- learnErrors(filtRs_4run, multithread = TRUE)
+
+# Water, Y2 (21 samples)
+filtRs_5run <- filtRs[meta_5run$Unique_ID]
+errR_5run <- learnErrors(filtRs_5run, multithread = TRUE)
+
+# Mucus, Z2 (15)
+# Need to do this one differently, because it is MiSeq i100 that uses binned quality scores. 
+filtRs_6run <- filtRs[meta_6run$Unique_ID]
+binnedQs <- c(2, 12, 24, 38)
+binnedQualErrfun <- makeBinnedQualErrfun(binnedQs)
+errR_6run <-learnErrors(filtRs_6run, errorEstimationFunction=binnedQualErrfun, multi=TRUE)
+
+
+#Save
+save(errR_1run, file = "errR_1run.RData")
+save(errR_2run, file = "errR_2run.RData")
+save(errR_3run, file = "errR_3run.RData")
+save(errR_4run, file = "errR_4run.RData")
+save(errR_5run, file = "errR_5run.RData")
+save(errR_6run, file = "errR_6run.RData")
+```
+
+
+
+_______________________________
+#Sample Inference
+- We are now ready to apply the core sample inference algorithm to the filtered and trimmed sequence data.
+- see: https://www.nature.com/articles/nmeth.3869#methods
+```{r}
+# Coral tissue, R2 (57 samples) 
+dadaFs_1run <- dada(filtFs_1run, err=errF_1run, multithread=TRUE)
+dadaRs_1run <- dada(filtRs_1run, err=errR_1run, multithread=TRUE)
+dadaFs_1run[[12]]
+
+# Water, T2 (26 samples)
+dadaFs_2run <- dada(filtFs_2run, err=errF_2run, multithread=TRUE)
+dadaRs_2run <- dada(filtRs_2run, err=errR_2run, multithread=TRUE)
+dadaFs_2run[[12]]
+
+# Coral tissue, V2 (65 samples)
+dadaFs_3run <- dada(filtFs_3run, err=errF_3run, multithread=TRUE)
+dadaRs_3run <- dada(filtRs_3run, err=errR_3run, multithread=TRUE)
+dadaFs_3run[[12]]
+
+# Mucus, Y2 (98 samples)
+dadaFs_4run <- dada(filtFs_4run, err=errF_4run, multithread=TRUE)
+dadaRs_4run <- dada(filtRs_4run, err=errR_4run, multithread=TRUE)
+dadaFs_4run[[12]]
+
+# Water, Y2 (21 samples)
+dadaFs_5run <- dada(filtFs_5run, err=errF_5run, multithread=TRUE)
+dadaRs_5run <- dada(filtRs_5run, err=errR_5run, multithread=TRUE)
+dadaFs_5run[[12]]
+
+# Mucus, Z2 (15)
+dadaFs_6run <- dada(filtFs_6run, err=errF_6run, multithread=TRUE)
+dadaRs_6run <- dada(filtRs_6run, err=errR_6run, multithread=TRUE)
+dadaFs_6run[[12]]
+```
+
+
+
+______________________________________
+# Merge paired reads
+
+```{r}
+# Coral tissue, R2 (57 samples) 
+mergers_1run <- mergePairs(dadaFs_1run, filtFs_1run, dadaRs_1run, filtRs_1run, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers_1run[[1]])
+
+# Water, T2 (26 samples)
+mergers_2run <- mergePairs(dadaFs_2run, filtFs_2run, dadaRs_2run, filtRs_2run, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers_2run[[1]])
+
+# Coral tissue, V2 (65 samples)
+mergers_3run <- mergePairs(dadaFs_3run, filtFs_3run, dadaRs_3run, filtRs_3run, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers_3run[[1]])
+
+# Mucus, Y2 (98 samples)
+mergers_4run <- mergePairs(dadaFs_4run, filtFs_4run, dadaRs_4run, filtRs_4run, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers_4run[[1]])
+
+# Water, Y2 (21 samples)
+mergers_5run <- mergePairs(dadaFs_5run, filtFs_5run, dadaRs_5run, filtRs_5run, verbose=TRUE)
+  # Inspect the merger data.frame from the first sample
+head(mergers_5run[[1]])
+
+# Mucus, Z2 (15)
+mergers_6run <- mergePairs(dadaFs_6run, filtFs_6run, dadaRs_6run, filtRs_6run, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers_6run[[1]])
+
+```
+
+
+__________________________________
+#Construct sequence table
+- We can now construct an amplicon sequence variant table (ASV) table, a higher-resolution version of the OTU table produced by traditional methods.
+```{r}
+seqtab_1run <- makeSequenceTable(mergers_1run)
+dim(seqtab_1run)
+
+seqtab_2run <- makeSequenceTable(mergers_2run)
+dim(seqtab_2run)
+
+seqtab_3run <- makeSequenceTable(mergers_3run)
+dim(seqtab_3run)
+
+seqtab_4run <- makeSequenceTable(mergers_4run)
+dim(seqtab_4run)
+
+seqtab_5run <- makeSequenceTable(mergers_5run)
+dim(seqtab_5run)
+
+seqtab_6run <- makeSequenceTable(mergers_6run)
+dim(seqtab_6run)
+
+seqtab_all <- mergeSequenceTables(seqtab_1run, seqtab_2run, seqtab_3run, seqtab_4run,  seqtab_5run,  seqtab_6run)                   
+```
+
+Inspect distribution of sequence lengths:
+Top row of output is the size of the sequence (we want 253), bottom row is how many of each length we have. 
+```{r}
+table(nchar(getSequences(seqtab_all)))
+seqtab2_all <- seqtab_all[,nchar(colnames(seqtab_all)) %in% 252:254]
+```
+
+
+
+__________________________________
+#Remove chimeras
+```{r}
+
+seqtab_all.nochim <- removeBimeraDenovo(seqtab2_all, method="consensus", multithread=2, verbose=TRUE)
+dim(seqtab_all.nochim)
+sum(seqtab_all.nochim)/sum(seqtab_all)
+
+
+seqtab_final <- seqtab_all.nochim
+
+#Save
+save(seqtab_final, file = "seqtab_final.RData")
+```
+
+
+
+
+__________________________________
+#Track reads through the pipeline
+- As a final check of our progress, we’ll look at the number of reads that made it through each step in the pipeline:
+```{r}
+getN <- function(x) sum(getUniques(x))
+
+dadaFs_all <- c(dadaFs_1run, dadaFs_2run, dadaFs_3run, dadaFs_4run, dadaFs_5run, dadaFs_6run)
+dadaRs_all <- c(dadaRs_1run, dadaRs_2run, dadaRs_3run, dadaRs_4run, dadaRs_5run, dadaRs_6run)
+merger_all <- c(mergers_1run, mergers_2run, mergers_3run, mergers_4run, mergers_5run, mergers_6run)
+
+track <- cbind(out, sapply(dadaFs_all, getN), sapply(dadaRs_all, getN), sapply(merger_all, getN), rowSums(seqtab_final))
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names 
+head(track)
+
+#look at percentages
+track.df <- as.data.frame(track)
+
+track.df$dF_percent <- track.df$denoisedF/track.df$filtered
+track.df$dR_percent <- track.df$denoisedR/track.df$filtered
+track.df$merge_percent <- track.df$merged/track.df$denoisedF
+track.df$nochim_percent <- track.df$nonchim/track.df$merged
+head(track.df)
+
+#Save
+write.csv(track.df, file = "track_through_dada2.csv")
+```
+
+
+
+_________________________
+#Assign taxonomy
+Assign taxonomy
+- download silva_nr_v132_train_set.fa.gz and silva_species_assignment_v132.fa.gz (https://zenodo.org/record/1172783) and put it in the FastQ_Data folder (inside another folder called Tax)
+```{r}
+taxa <- assignTaxonomy(seqtab_final, "~/Documents/WHOI/silva_nr99_v138.1_train_set.fa.gz", multithread=TRUE)
+```
+
+Add species
+```{r}
+# taxa <- addSpecies(taxa, "~/Documents/WHOI/silva_species_assignment_v138.1.fa.gz")
+```
+
+addSpecies() keeps on failing and making my R crash, so trying this work around from: https://github.com/benjjneb/dada2/issues/733
+```{r}
+chunk.size <- 4000
+chunks <- split(c(1:nrow(taxa)),
+sort(c(1:nrow(taxa))%%ceiling(nrow(taxa)/chunk.size)))
+
+chunks.species <- lapply(chunks,
+function(x){
+return(addSpecies(taxa[x,],
+refFasta = "~/Documents/WHOI/silva_species_assignment_v138.1.fa.gz", verbose = TRUE))
+})
+taxa.species <- do.call(rbind, chunks.species)
+
+
+save(taxa.species, file="taxa.RData")
+```
+
+
+
+```{r}
+#Let’s inspect the taxonomic assignments:
+taxa.print <- taxa.species 
+rownames(taxa.print) <- NULL # Removing sequence rownames for display only
+head(taxa.print)
+```
+
+Replace the NAs with "unknown"
+```{r}
+#Replace the NAs with "unknown"
+taxa_df <- as.data.frame(taxa.species)
+dim(taxa_df) 
+taxa_NA_is_Unknown <- taxa_df %>%
+  mutate_all(~ ifelse(is.na(.), "unknown", .))
+View(taxa_NA_is_Unknown)
+
+
+save(taxa_NA_is_Unknown, file="taxa_NA_is_Unknown.RData")
+```
+
+
+Replacing NAs with the lowest taxonomic level 
+```{r}
+#Replacing NAs with the lowest taxonomic level
+#replace NAs with the deepest taxonomy available
+taxa_NA_is_LowestTax <- taxa_df
+taxa_NA_is_LowestTax$Kingdom <- as.character(taxa_NA_is_LowestTax$Kingdom)
+king_na <- which(is.na(taxa_NA_is_LowestTax$Kingdom))
+taxa_NA_is_LowestTax[king_na, "Kingdom"] <- 'Unknown'
+
+taxa_NA_is_LowestTax$Phylum <- as.character(taxa_NA_is_LowestTax$Phylum)
+phy_na <- which(is.na(taxa_NA_is_LowestTax$Phylum))
+taxa_NA_is_LowestTax[phy_na, "Phylum"] <- taxa_NA_is_LowestTax$Kingdom[phy_na] 
+
+taxa_NA_is_LowestTax$Class <- as.character(taxa_NA_is_LowestTax$Class)
+cl_na <- which(is.na(taxa_NA_is_LowestTax$Class))
+taxa_NA_is_LowestTax[cl_na, "Class"] <- taxa_NA_is_LowestTax$Phylum[cl_na]
+
+taxa_NA_is_LowestTax$Order <- as.character(taxa_NA_is_LowestTax$Order)
+ord_na <- which(is.na(taxa_NA_is_LowestTax$Order))
+taxa_NA_is_LowestTax[ord_na, "Order"] <- taxa_NA_is_LowestTax$Class[ord_na]
+
+taxa_NA_is_LowestTax$Family <- as.character(taxa_NA_is_LowestTax$Family)
+fam_na <- which(is.na(taxa_NA_is_LowestTax$Family))
+taxa_NA_is_LowestTax[fam_na, "Family"] <- taxa_NA_is_LowestTax$Order[fam_na]
+
+taxa_NA_is_LowestTax$Genus <- as.character(taxa_NA_is_LowestTax$Genus)
+gen_na <- which(is.na(taxa_NA_is_LowestTax$Genus))
+taxa_NA_is_LowestTax[gen_na, "Genus"] <- taxa_NA_is_LowestTax$Family[gen_na]
+
+taxa_NA_is_LowestTax$Species <- as.character(taxa_NA_is_LowestTax$Species)
+spec_na <- which(is.na(taxa_NA_is_LowestTax$Species))
+taxa_NA_is_LowestTax[spec_na, "Species"] <- taxa_NA_is_LowestTax$Genus[spec_na]
+
+View(taxa_NA_is_LowestTax)
+
+save(taxa_NA_is_LowestTax, file="taxa_NA_is_LowestTax.RData")
+```
+
+
+
+_______________________________
+#Evaluate accuracy. 
+Downlaod reference fasta for mock community here: https://github.com/itsmisterbrown/microfiltR/blob/master/HMP_MOCK.v35.fasta
+```{r}
+#set new path to mock reference file, because it isn't in FastQ_Data
+path <-  "~/Documents/WHOI"
+```
+
+#####Library R2
+```{r}
+unqs.mock <- seqtab_final["Mock_R2",]
+unqs.mock <- sort(unqs.mock[unqs.mock>0], decreasing=TRUE) # Drop ASVs absent in the Mock
+cat("DADA2 inferred", length(unqs.mock), "sample sequences present in the Mock community.\n")
+
+mock.ref <- getSequences(file.path(path, "HMP_MOCK.v35.fasta"))
+match.ref <- sum(sapply(names(unqs.mock), function(x) any(grepl(x, mock.ref))))
+cat("Of those,", sum(match.ref), "were exact matches to the expected reference sequences.\n")
+
+```
+
+#####Library T2
+```{r}
+unqs.mock <- seqtab_final["Mock_T2",]
+unqs.mock <- sort(unqs.mock[unqs.mock>0], decreasing=TRUE) # Drop ASVs absent in the Mock
+cat("DADA2 inferred", length(unqs.mock), "sample sequences present in the Mock community.\n")
+
+mock.ref <- getSequences(file.path(path, "HMP_MOCK.v35.fasta"))
+match.ref <- sum(sapply(names(unqs.mock), function(x) any(grepl(x, mock.ref))))
+cat("Of those,", sum(match.ref), "were exact matches to the expected reference sequences.\n")
+```
+
+
+#####Library V2
+```{r}
+unqs.mock <- seqtab_final["Mock_V2",]
+unqs.mock <- sort(unqs.mock[unqs.mock>0], decreasing=TRUE) # Drop ASVs absent in the Mock
+cat("DADA2 inferred", length(unqs.mock), "sample sequences present in the Mock community.\n")
+
+mock.ref <- getSequences(file.path(path, "HMP_MOCK.v35.fasta"))
+match.ref <- sum(sapply(names(unqs.mock), function(x) any(grepl(x, mock.ref))))
+cat("Of those,", sum(match.ref), "were exact matches to the expected reference sequences.\n")
+
+```
+
+
+
+#####Library Y2
+```{r}
+unqs.mock <- seqtab_final["Mock_Y2",]
+unqs.mock <- sort(unqs.mock[unqs.mock>0], decreasing=TRUE) # Drop ASVs absent in the Mock
+cat("DADA2 inferred", length(unqs.mock), "sample sequences present in the Mock community.\n")
+
+mock.ref <- getSequences(file.path(path, "HMP_MOCK.v35.fasta"))
+match.ref <- sum(sapply(names(unqs.mock), function(x) any(grepl(x, mock.ref))))
+cat("Of those,", sum(match.ref), "were exact matches to the expected reference sequences.\n")
+
+```
+
+
+#####Library Z2
+```{r}
+unqs.mock <- seqtab_final["Mock_Z2",]
+unqs.mock <- sort(unqs.mock[unqs.mock>0], decreasing=TRUE) # Drop ASVs absent in the Mock
+cat("DADA2 inferred", length(unqs.mock), "sample sequences present in the Mock community.\n")
+
+mock.ref <- getSequences(file.path(path, "HMP_MOCK.v35.fasta"))
+match.ref <- sum(sapply(names(unqs.mock), function(x) any(grepl(x, mock.ref))))
+cat("Of those,", sum(match.ref), "were exact matches to the expected reference sequences.\n")
+
+```
+
+
+
+#Make ASV tables and taxonomy files
+Make sure the seqtab_final file with all the ASVs and the taxa are all in the same order. Save the sequences with an ASV# identifier.
+```{r}
+otus <- seqtab_final
+taxonomy <- taxa_NA_is_LowestTax
+
+idx <- match(rownames(taxonomy), colnames(otus))
+otus <- otus[,idx]
+#Warn if there's a mismatch.
+if (any(is.na(idx))) {
+  warning("Some taxonomy row names were not found in OTU column names!")
+  print(rownames(taxonomy)[is.na(idx)])
+}
+
+#save a dataframe with a new ASV identifier and the sequence from the rownames for taxa
+ASVseqs <- data.frame("ASV_ID" = paste0("ASV", seq(from = 1, to = ncol(seqtab_final), by = 1)), "sequence" = rownames(taxonomy))
+
+
+#rename otu and taxa dataframe so they are easier to interpret
+colnames(otus) <- ASVseqs$ASV_ID
+rownames(taxonomy) <- ASVseqs$ASV_ID
+```
+
+
+
+#Save final tables
+Write these tables so you have them for future data analysis
+```{r}
+save(otus, file="otus_LCT_AllSamples_final.RData")
+write.table(taxonomy, file = "taxonomy_LCT_AllSamples_final.txt", sep = "\t", row.names = TRUE, col.names = TRUE)
+write.table(ASVseqs, file = "ASVsequences_LCT_AllSamples_final.txt", sep = "\t", row.names = TRUE, col.names = TRUE)
+```
+
+
+
+
