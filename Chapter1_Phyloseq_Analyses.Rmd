@@ -1,0 +1,2002 @@
+---
+title: "Chapter1_Phyloseq_Analyses"
+author: "JeanneBloomberg"
+date: "2025-07-30"
+output: html_document
+---
+
+----------------------------------------------------
+#Set up
+```{r}
+setwd("~/Documents/WHOI/Projects/LittleCaymanTransplant_Analyses")
+```
+
+```{r}
+library(dplyr); packageVersion("dplyr")
+library(tidyr); packageVersion("tidyr")
+library(knitr); packageVersion("knitr")
+library(corncob); packageVersion("corncob")
+library(vegan); packageVersion("vegan")
+library(phyloseq); packageVersion("phyloseq")
+library(ggplot2); packageVersion("ggplot2")
+library(stringr)
+library(ggforce)
+library(ggpattern)
+library(ggpubr)
+library(cowplot)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(multcompView)
+library(ggrepel)
+library(tidyr)
+library(tibble)
+library(stats)
+library(fmsb)
+library(seqinr)
+
+```
+
+
+----------------------------------------------------
+#Upload data
+```{r}
+load("otus_LCT_AllSamples_final.RData")
+ASV <- as.matrix(otus)
+
+taxa <- as.matrix(read.table("taxonomy_LCT_AllSamples_final.txt", sep = "\t", row.names = 1, header = TRUE))
+
+ASV_ID <-read.table("ASVsequences_LCT_AllSamples_final.txt", sep = "\t", row.names = 1, header = TRUE)
+
+metadata <- read.csv("Meta_Data.csv", header = TRUE)
+rownames(metadata) <- metadata$sample_names
+```
+
+
+----------------------------------------------------
+#Make base phyloseq object
+```{r}
+ASV = otu_table(ASV, taxa_are_rows = FALSE)
+TAX = tax_table(taxa)
+META = sample_data(metadata)
+
+ps <- phyloseq(ASV, TAX, META) %>%
+  filter_taxa(function(x) sum(x) > 0, prune = TRUE)
+
+```
+
+##### ASVs per sample
+```{r}
+#To find the number of ASVs per sample, but including the ASV multiple times in one sample
+  otu_afterdada2 <- as.data.frame(otu_table(ps))
+  otu_afterdada2$after_dada2_sum <- rowSums(otu_afterdada2)
+  otu_afterdada2$sample_names <- rownames(otu_afterdada2)
+  mean(otu_afterdada2$after_dada2_sum)  #60777.75
+  sd(otu_afterdada2$after_dada2_sum) #80512.08
+#To find the number of unique ASVs per sample (i.e. ASVs with count > 0)
+  otu_afterdada2$unique_ASVs <- rowSums(otu_afterdada2 > 0)
+  mean(otu_afterdada2$unique_ASVs) #646
+  sd(otu_afterdada2$unique_ASVs) #646.2636
+#
+#Get the average number of ASVs from MiSeq and MiSeq i100. First I need to get the meta data and otu_afterdada2 in the same order (via sample_names)
+  otu_meta_afterdada2 <- left_join(metadata, otu_afterdada2, by = "sample_names")
+  cleaned_afterdada2 <- otu_meta_afterdada2 %>% select(-starts_with("ASV"))
+# number of ASVs per sample, but including the ASV multiple times in one sample
+  cleaned_afterdada2 %>% summarise(
+    mean_MiSeqi100 = mean(after_dada2_sum[Library_ID == "Z2"], na.rm = TRUE),
+    SD_MiSeqi100 = sd(after_dada2_sum[Library_ID == "Z2"], na.rm = TRUE),
+    mean_MiSeq = mean(after_dada2_sum[Library_ID != "Z2"], na.rm = TRUE),
+    SD_MiSeq = sd(after_dada2_sum[Library_ID != "Z2"], na.rm = TRUE))
+          #   mean_MiSeqi100 SD_MiSeqi100 mean_MiSeq SD_MiSeq
+          #        249794.2     105733.7   50158.85  64276.38
+# To find the number of unique ASVs per sample (i.e. ASVs with count > 0)
+  cleaned_afterdada2 %>% summarise(
+    mean_MiSeqi100 = mean(unique_ASVs[Library_ID == "Z2"], na.rm = TRUE),
+    SD_MiSeqi100 = sd(unique_ASVs[Library_ID == "Z2"], na.rm = TRUE),
+    mean_MiSeq = mean(unique_ASVs[Library_ID != "Z2"], na.rm = TRUE),
+    SD_MiSeq = sd(unique_ASVs[Library_ID != "Z2"], na.rm = TRUE),)
+    #   mean_MiSeqi100 SD_MiSeqi100 mean_MiSeq SD_MiSeq
+    #            1322     777.9457   608.0225 618.1739
+
+#number of MiSeq i100 samples:
+nrow(metadata[metadata$Library_ID == "Z2", ]) #15
+#number of MiSeq samples:
+nrow(metadata[metadata$Library_ID != "Z2", ]) #267
+  
+```
+
+
+##### Rarefy i100 samples
+```{r}
+# Extract sample data and identify Z2 samples
+z2_samples <- rownames(metadata[metadata$Library_ID == "Z2", ])
+non_z2_samples <- rownames(metadata[metadata$Library_ID != "Z2", ])
+
+# Subset phyloseq object
+ps_z2 <- prune_samples(z2_samples, ps)
+    # 15 samples
+    # 65089 ASVs
+ps_non_z2 <- prune_samples(non_z2_samples, ps)
+    # 267 samples
+    # 65089 ASVs
+  quicklook <- as.data.frame(sample_sums(ps_non_z2))
+  rm(quicklook)  
+   
+# Rarefy Z2 samples to 50159 reads
+set.seed(18)  # for reproducibility
+ps_z2_rarefied <- rarefy_even_depth(ps_z2, sample.size = 50159, rngseed = 18, verbose = FALSE)
+    # 14 samples
+    # 12548 ASVs
+
+setdiff(sample_names(ps_z2), sample_names(ps_z2_rarefied)) #dropped Neg_Z2
+sample_sums(ps_z2) #this is because Neg_Z2 had 24218 reads, which is less than 50159. 
+
+#double check it worked
+reads_per_sample <- sample_sums(ps_z2_rarefied)
+reads_per_sample #everything is 50159! so that's good
+
+# Combine back both parts
+ps_rarefied <- merge_phyloseq(ps_non_z2, ps_z2_rarefied)
+  # 281 samples
+  # 65089 ASVs
+otu.rarefied <- as.data.frame(otu_table(ps_rarefied))
+otu.rarefied$rarefied_sum <- rowSums(otu.rarefied)
+otu.rarefied["Neg_Z2", ] <- NA
+mean(otu.rarefied$rarefied_sum, na.rm = TRUE) #50158.86
+
+```
+
+
+#Filter base phyloseq object
+```{r}
+#remove contaminants
+load("contam.RData")
+nrow(contam[contam$contaminant == "TRUE", ]) #148
+ 
+ps.decontam <- prune_taxa(!contam$contaminant, ps_rarefied)
+  # 281 samples
+  # 64941 ASVs
+otu.decontam <- as.data.frame(otu_table(ps.decontam))
+otu.decontam$decontam_sum <- rowSums(otu.decontam)
+otu.decontam["Neg_Z2", ] <- NA
+
+#remove Mitochondria and Chloroplast
+ps.nomitochloro <- ps.decontam %>%
+    subset_taxa(Family !="Mitochondria" & Order !="Chloroplast")
+       # 281 samples
+       # 61665 ASVs
+ otu.nomitochloro <- as.data.frame(otu_table(ps.nomitochloro))
+ otu.nomitochloro$no_mitochloro_sum <- rowSums(otu.nomitochloro)
+ otu.nomitochloro$unique_ASVs <- rowSums(otu.nomitochloro > 0)
+ mean(otu.nomitochloro$unique_ASVs) #599.7046
+ otu.nomitochloro["Neg_Z2", ] <- NA
+
+#make a dataframe with the row sums (aka total reads) after each step 
+
+reads_through_steps <- as.data.frame(cbind("sample_names1" = otu_afterdada2$sample_names,
+                                     "Reads_After_Dada2" = otu_afterdada2$after_dada2_sum,
+                                     "sample_names2" = rownames(otu.rarefied),
+                                     "Reads_After_Rarefy" = otu.rarefied$rarefied_sum,
+                                     "sample_names3" = rownames(otu.decontam),
+                                     "Reads_After_Decontam" = otu.decontam$decontam_sum,
+                                     "sample_names4" = rownames(otu.nomitochloro),
+                                     "Reads_After_NoMitoChloro" = otu.nomitochloro$no_mitochloro_sum))
+
+
+write.csv(reads_through_steps, "reads_through_steps.csv")
+```
+
+
+```{r}
+## Remove samples with reads less than 10,000 and the unknown samples
+ps.filtered <- ps.nomitochloro %>%
+  prune_samples(sample_sums(.) > 9981, .) %>%
+  filter_taxa(function(x) sum(x) > 0, prune = TRUE) #remove taxa with zero abundance 
+    # 229 samples
+    # 59348 ASVså
+
+## Number of reads from the samples removed due to low read yield:
+sample_reads <- sample_sums(ps.nomitochloro)
+removed_samples <- names(sample_reads[sample_reads <= 9981])
+removed_sample_df <- as.data.frame(sample_reads[removed_samples])
+
+
+#To find the number of ASVs per sample, but including the ASV multiple times in one sample
+  otu_ps.filtered <- as.data.frame(otu_table(ps.filtered))
+  otu_ps.filtered$after_dada2_sum <- rowSums(otu_ps.filtered)
+  otu_ps.filtered$sample_names <- rownames(otu_ps.filtered)
+  sum(otu_ps.filtered$after_dada2_sum) #11875479
+  mean(otu_ps.filtered$after_dada2_sum)  #51857.99
+  sd(otu_ps.filtered$after_dada2_sum) #51872.93
+#To find the number of unique ASVs per sample (i.e. ASVs with count > 0)
+  otu_ps.filtered$unique_ASVs <- rowSums(otu_ps.filtered > 0)
+  mean(otu_ps.filtered$unique_ASVs) #709.5153
+  sd(otu_ps.filtered$unique_ASVs) #624.7191
+
+
+#samples that were removed:
+low_read_samples <- as.data.frame(sample_names(ps.nomitochloro)[sample_sums(ps.nomitochloro) <= 9981])
+write.csv(low_read_samples, "low_read_samples.csv")
+```
+
+So this is 52 samples removed due to low read yield (below 9,982 reads).
+Of these, 29 are negative controls and 23 are samples. 
+All of the samples that are being removed are from Libraries V2 and Y2. This might not mean anything, but I am noting it. 
+There are 33 negative controls, 5 mocks, and 244 samples in this data set.
+If I remove these 23 samples, I will still have 221 samples left in my data set to work with. I think this is likely enough. 
+The samples being removed include 16 coral samples, 6 mucus samples, and 1 water sample. I think this is within the realm of normal expectations. 
+
+#Data evenness
+```{r}
+
+ps.nocontrol <- ps.filtered %>%
+  subset_samples(Sample_Type != "Control") %>%
+  subset_samples(Sample_Type != "Mock") %>%
+  subset_samples(Sample_Type != "Water") %>%
+  filter_taxa(function(x) sum(x) > 0, TRUE) %>%
+  transform_sample_counts(function(x) x / sum(x)) #this makes everything in relative abundances
+
+
+meta_filtered <- sample_data(ps.nocontrol)
+
+data <- meta_filtered %>%
+  group_by(Treatment, Site, Sample_Type) %>%
+  summarize(freq = n())
+
+ggplot(data, aes(x = Treatment, 
+                 y = freq, 
+                 fill = Site, 
+                 group = interaction(Site, Sample_Type),
+                 pattern = Sample_Type)) +
+  scale_fill_manual(values = c("lightseagreen", "magenta4")) +
+  geom_bar_pattern(stat = "identity", 
+                   position = position_dodge(width = 0.9),
+                   pattern_fill = "black",
+                   pattern_density = 0.3,
+                   pattern_spacing = 0.03,
+                   pattern_key_scale_factor = 0.5) +
+  scale_pattern_manual(values = c("Mucus" = "stripe", "Tissue" = "none")) +
+  theme(
+    panel.grid = element_blank(),
+    text = element_text(size = 15),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title.y = element_text(size = 15)
+  ) +
+  labs(x = "", y = "Number of samples") +
+  geom_text(aes(y = freq, label = freq), 
+            position = position_dodge(width = 0.9), 
+            vjust = -0.3, size = 4) +
+  scale_x_discrete(labels = c(
+    "Mesophotic initial",
+    "Mesophotic to mesophotic",
+    "Mesophotic to shallow",
+    "Shallow initial",
+    "Shallow to mesophotic",
+    "Shallow to shallow"
+  ))
+```
+
+#Survivorship
+Did some excel calculations with these outputs, which can be found in: 
+~/Documents/WHOI/Projects/LittleCaymanTransplant/Data_Analyses/Survivorship_data.xlsx
+```{r}
+#I need a different meta data for this, because the double outplanting at coral city shallow means that some of the survivorship data is lost in my current meta data. Because I would need two lines per initial coral for fate. 
+
+Survivorship_data <- read.csv("Survivorship_data.csv", header = TRUE)
+
+total_check <- Survivorship_data %>%
+  dplyr::count(Treatment)
+rm(total_check)
+  
+Fate_counts <- Survivorship_data %>%
+  dplyr::count(Treatment, Fate)
+
+Fate_percent <- Fate_counts %>%
+  group_by(Treatment) %>%
+  mutate(percent = n / sum(n) * 100)
+
+
+
+ggplot(Fate_percent, aes(x = Treatment, y = percent, fill = Fate)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(y = "Percent of corals",
+       x = "",
+       fill = "Fate") +
+  scale_fill_manual(values = c("grey", "darkblue")) +
+  theme(panel.grid = element_blank())
+
+
+```
+
+
+
+#PCoAs  
+##### Sample Type
+rm(list = setdiff(ls(), c("ps.filtered", "metadata")))
+
+Phyloseq objects with counts so that I can centered log ratio transform them
+
+```{r}
+#All samples
+ps.NoControl <- ps.filtered %>%
+  subset_samples(Sample_Type != "Control") %>% #remove controls
+  subset_samples(Sample_Type != "Mock") %>% #remove controls
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros
+
+# transform the data
+ps.NoControl.clr <- microbiome::transform(ps.NoControl, 'clr') #clr = centered log ratio
+ord.NoControl.clr <- ordinate(ps.NoControl.clr, "RDA", "euclidean", set.seed(18))
+plot_ordination(ps.NoControl.clr, ord.NoControl.clr , type="samples", color="Sample_Type") +
+  geom_point(size = 4) +
+  theme(text=element_text(size=14), panel.grid = element_blank()) +
+  labs(title = "All samples with no controls")
+
+            Permanova_metadata <- data.frame(sample_data(ps.NoControl.clr))
+            perm <- adonis2(distance(ps.NoControl.clr, method="euclidean") ~ Sample_Type,
+                    data = Permanova_metadata, 
+                    permutations = how(blocks = Permanova_metadata$Site))
+            perm
+
+            rm(Permanova_metadata)
+            rm(perm)
+
+```
+
+##### Site
+rm(list = setdiff(ls(), c("ps.filtered", "metadata")))
+```{r}
+#Tissue
+ps.Tissue <- ps.filtered %>%
+  subset_samples(Sample_Type == "Tissue") %>% 
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros
+
+#Check
+unique(sample_data(ps.Tissue)$Sample_Type)
+
+ps.Tissue.clr <- microbiome::transform(ps.Tissue, 'clr') #clr = centered log ratio
+ord.Tissue.clr <- ordinate(ps.Tissue.clr, "RDA", "euclidean", set.seed(18))
+plot_ordination(ps.Tissue.clr, ord.Tissue.clr , type="samples", color="Site") +
+  geom_point(size = 4) +
+  theme(text=element_text(size=14), panel.grid = element_blank()) +
+  labs(title = "Tissues")
+
+            Permanova_metadata <- data.frame(sample_data(ps.Tissue.clr))
+            perm <- adonis2(distance(ps.Tissue.clr, method="euclidean") ~ Site / Coral_ID,
+                    data = Permanova_metadata)
+            perm
+
+                       
+            rm(Permanova_metadata)
+            rm(perm)
+```
+
+rm(list = setdiff(ls(), c("ps.filtered", "metadata")))
+```{r}
+#Mucus
+ps.Mucus <- ps.filtered %>%
+  subset_samples(Sample_Type == "Mucus") %>% #
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zero
+
+#Check
+unique(sample_data(ps.Mucus)$Sample_Type)
+
+ps.Mucus.clr <- microbiome::transform(ps.Mucus, 'clr') #clr = centered log ratio
+ord.Mucus.clr <- ordinate(ps.Mucus.clr, "RDA", "euclidean", set.seed(18))
+plot_ordination(ps.Mucus.clr, ord.Mucus.clr , type="samples", color="Site") +
+  geom_point(size = 4) +
+  theme(text=element_text(size=14), panel.grid = element_blank()) +
+  labs(title = "Mucus")
+
+            Permanova_metadata <- data.frame(sample_data(ps.Mucus.clr))
+            perm <- adonis2(distance(ps.Mucus.clr, method="euclidean") ~ Site / Coral_ID,
+                    data = Permanova_metadata)
+            perm
+
+               
+            rm(Permanova_metadata)
+            rm(perm)
+```
+
+
+##### Timepoint
+rm(list = setdiff(ls(), c("ps.filtered", "metadata")))
+```{r}
+#Tissue
+ps.Tissue <- ps.filtered %>%
+  subset_samples(Sample_Type == "Tissue") %>% 
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros
+
+#Check
+unique(sample_data(ps.Tissue)$Sample_Type)
+
+ps.Tissue.clr <- microbiome::transform(ps.Tissue, 'clr') #clr = centered log ratio
+ord.Tissue.clr <- ordinate(ps.Tissue.clr, "RDA", "euclidean", set.seed(18))
+plot_ordination(ps.Tissue.clr, ord.Tissue.clr , type="samples", color="Timepoint") +
+  geom_point(size = 4) +
+  theme(text=element_text(size=14), panel.grid = element_blank()) +
+  labs(title = "Tissues") +
+  scale_color_manual(values = c("mediumpurple2","orange2")) 
+
+            Permanova_metadata <- data.frame(sample_data(ps.Tissue.clr))
+            perm <- adonis2(distance(ps.Tissue.clr, method="euclidean") ~ Timepoint / Coral_ID,
+                    data = Permanova_metadata)
+            perm
+
+                              
+            rm(Permanova_metadata)
+            rm(perm)
+```
+
+rm(list = setdiff(ls(), c("ps.filtered", "metadata")))
+```{r}
+#Mucus
+ps.Mucus <- ps.filtered %>%
+  subset_samples(Sample_Type == "Mucus") %>% #
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zero
+
+#Check
+unique(sample_data(ps.Mucus)$Sample_Type)
+
+ps.Mucus.clr <- microbiome::transform(ps.Mucus, 'clr') #clr = centered log ratio
+ord.Mucus.clr <- ordinate(ps.Mucus.clr, "RDA", "euclidean", set.seed(18))
+plot_ordination(ps.Mucus.clr, ord.Mucus.clr , type="samples", color="Timepoint") +
+  geom_point(size = 4) +
+  theme(text=element_text(size=14), panel.grid = element_blank()) +
+  labs(title = "Mucus") +
+  scale_color_manual(values = c("mediumpurple2","orange2")) 
+
+
+            Permanova_metadata <- data.frame(sample_data(ps.Mucus.clr))
+            perm <- adonis2(distance(ps.Mucus.clr, method="euclidean") ~ Timepoint / Coral_ID,
+                    data = Permanova_metadata)
+            perm
+ 
+                
+            rm(Permanova_metadata)
+            rm(perm)
+```
+
+
+
+
+
+#####Initials
+rm(list = setdiff(ls(), c("ps.filtered", "metadata")))
+```{r}
+#Tissue
+ps.Initial.Tissue <- ps.filtered %>%
+  subset_samples(Timepoint == "Initial") %>% 
+  subset_samples(Sample_Type == "Tissue") %>% 
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros
+
+#Check
+unique(sample_data(ps.Initial.Tissue)$Sample_Type)
+unique(sample_data(ps.Initial.Tissue)$Timepoint)
+unique(sample_data(ps.Initial.Tissue)$Treatment)
+
+
+ps.Initial.Tissue.clr <- microbiome::transform(ps.Initial.Tissue, 'clr') #clr = centered log ratio
+ord.Initial.Tissue.clr <- ordinate(ps.Initial.Tissue.clr, "RDA", "euclidean", set.seed(18))
+plot_ordination(ps.Initial.Tissue.clr, ord.Initial.Tissue.clr , type="samples", color="Treatment", shape="Site") +
+  geom_point(size = 4) +
+  theme(text=element_text(size=14), panel.grid = element_blank()) +
+  labs(title = "Initial tissue")
+
+            #Test site
+            Permanova_metadata <- data.frame(sample_data(ps.Initial.Tissue.clr))
+            perm <- adonis2(distance(ps.Initial.Tissue.clr, method="euclidean") ~ Site,
+                    data = Permanova_metadata)
+            perm
+ 
+            
+            rm(Permanova_metadata)
+            rm(perm)
+            
+            
+            #Test depth
+            Permanova_metadata <- data.frame(sample_data(ps.Initial.Tissue.clr))
+            perm <- adonis2(distance(ps.Initial.Tissue.clr, method="euclidean") ~ Treatment,
+                    data = Permanova_metadata, 
+                    permutations = how(blocks = Permanova_metadata$Site))
+            perm
+
+            
+```
+
+rm(list = setdiff(ls(), c("ps.filtered", "metadata")))
+```{r}
+#Mucus
+ps.Initial.Mucus <- ps.filtered %>%
+  subset_samples(Timepoint == "Initial") %>% 
+  subset_samples(Sample_Type == "Mucus") %>% 
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros
+
+#Check
+unique(sample_data(ps.Initial.Mucus)$Sample_Type)
+unique(sample_data(ps.Initial.Mucus)$Timepoint)
+unique(sample_data(ps.Initial.Mucus)$Treatment)
+
+ps.Initial.Mucus.clr <- microbiome::transform(ps.Initial.Mucus, 'clr') #clr = centered log ratio
+ord.Initial.Mucus.clr <- ordinate(ps.Initial.Mucus.clr, "RDA", "euclidean", set.seed(18))
+plot_ordination(ps.Initial.Mucus.clr, ord.Initial.Mucus.clr , type="samples", color="Treatment", shape="Site") +
+  geom_point(size = 4) +
+  theme(text=element_text(size=14), panel.grid = element_blank()) +
+  labs(title = "Initial mucus")
+
+            #Test site
+            Permanova_metadata <- data.frame(sample_data(ps.Initial.Mucus.clr))
+            perm <- adonis2(distance(ps.Initial.Mucus.clr, method="euclidean") ~ Site,
+                    data = Permanova_metadata)
+            perm
+
+            
+            rm(Permanova_metadata)
+            rm(perm)
+            
+            
+            #Test depth
+            Permanova_metadata <- data.frame(sample_data(ps.Initial.Mucus.clr))
+            perm <- adonis2(distance(ps.Initial.Mucus.clr, method="euclidean") ~ Treatment,
+                    data = Permanova_metadata, 
+                    permutations = how(blocks = Permanova_metadata$Site))
+            perm
+
+            
+            rm(Permanova_metadata)
+            rm(perm)
+```
+
+
+
+
+
+#####Fate
+rm(list = setdiff(ls(), c("ps.filtered", "metadata")))
+```{r}
+#Tissue
+ps.Initial.Tissue <- ps.filtered %>%
+  subset_samples(Timepoint == "Initial") %>% 
+  subset_samples(Sample_Type == "Tissue") %>% 
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros
+
+#Check
+unique(sample_data(ps.Initial.Tissue)$Sample_Type)
+unique(sample_data(ps.Initial.Tissue)$Timepoint)
+unique(sample_data(ps.Initial.Tissue)$Treatment)
+
+
+ps.Initial.Tissue.clr <- microbiome::transform(ps.Initial.Tissue, 'clr') #clr = centered log ratio
+ord.Initial.Tissue.clr <- ordinate(ps.Initial.Tissue.clr, "RDA", "euclidean", set.seed(18))
+
+plot_ordination(ps.Initial.Tissue.clr, ord.Initial.Tissue.clr , type="samples", color="Shallow_fate", shape="Origin_Depth_DS") +
+  geom_point(size = 4) +
+  theme(text=element_text(size=14), panel.grid = element_blank()) +
+  labs(title = "Initial tissue from both sites")
+
+plot_ordination(ps.Initial.Tissue.clr, ord.Initial.Tissue.clr , type="samples", color="Deep_fate", shape="Origin_Depth_DS") +
+  geom_point(size = 4) +
+  theme(text=element_text(size=14), panel.grid = element_blank()) +
+  labs(title = "Initial tissue from both sites")
+```
+
+rm(list = setdiff(ls(), c("ps.filtered", "metadata")))
+```{r}
+#Mucus
+ps.Initial.Mucus <- ps.filtered %>%
+  subset_samples(Timepoint == "Initial") %>% 
+  subset_samples(Sample_Type == "Mucus") %>% 
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros
+
+#Check
+unique(sample_data(ps.Initial.Mucus)$Sample_Type)
+unique(sample_data(ps.Initial.Mucus)$Timepoint)
+unique(sample_data(ps.Initial.Mucus)$Treatment)
+
+ps.Initial.Mucus.clr <- microbiome::transform(ps.Initial.Mucus, 'clr') #clr = centered log ratio
+ord.Initial.Mucus.clr <- ordinate(ps.Initial.Mucus.clr, "RDA", "euclidean", set.seed(18))
+
+plot_ordination(ps.Initial.Mucus.clr, ord.Initial.Mucus.clr , type="samples", color="Shallow_fate", shape="Origin_Depth_DS") +
+  geom_point(size = 4) +
+  theme(text=element_text(size=14), panel.grid = element_blank()) +
+  labs(title = "Initial mucus from both sites")
+plot_ordination(ps.Initial.Mucus.clr, ord.Initial.Mucus.clr , type="samples", color="Deep_fate", shape="Origin_Depth_DS") +
+  geom_point(size = 4) +
+  theme(text=element_text(size=14), panel.grid = element_blank()) +
+  labs(title = "Initial mucus from both sites")
+```
+
+
+##### Rack
+rm(list = setdiff(ls(), c("ps.filtered", "metadata")))
+```{r}
+#Tissue
+ps.Final.Tissue <- ps.filtered %>%
+  subset_samples(Sample_Type == "Tissue") %>% 
+    subset_samples(Timepoint == "Final") %>% 
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros
+
+#Check
+unique(sample_data(ps.Final.Tissue)$Sample_Type)
+unique(sample_data(ps.Final.Tissue)$Timepoint)
+unique(sample_data(ps.Final.Tissue)$Treatment)
+
+ps.Final.Tissue.clr <- microbiome::transform(ps.Final.Tissue, 'clr') #clr = centered log ratio
+ord.Final.Tissue.clr<- ordinate(ps.Final.Tissue.clr, "RDA", "euclidean", set.seed(18))
+
+plot_ordination(ps.Final.Tissue.clr, ord.Final.Tissue.clr , type="samples", color="Outplant_rack") +
+  geom_point(size = 4) +
+  theme(text=element_text(size=14), panel.grid = element_blank()) +
+  labs(title = "All tissue samples")
+plot_ordination(ps.Final.Tissue.clr, ord.Final.Tissue.clr , type="samples", color="Treatment") +
+  geom_point(size = 4) +
+  theme(text=element_text(size=14), panel.grid = element_blank()) +
+  labs(title = "All tissue samples")
+
+
+            #Test treatment (only DS, DD, SD, SS)
+            Permanova_metadata <- data.frame(sample_data(ps.Final.Tissue.clr))
+            perm <- adonis2(distance(ps.Final.Tissue.clr, method="euclidean") ~ Outplant_rack,
+                    data = Permanova_metadata,
+                    permutations = how(blocks = Permanova_metadata$Site))
+            perm
+
+            
+          
+            rm(Permanova_metadata)
+            rm(perm)
+```
+
+rm(list = setdiff(ls(), c("ps.filtered", "metadata")))
+```{r}
+#Mucus
+ps.Final.Mucus <- ps.filtered %>%
+  subset_samples(Sample_Type == "Mucus") %>% 
+    subset_samples(Timepoint == "Final") %>% 
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros
+
+#Check
+unique(sample_data(ps.Final.Mucus)$Sample_Type)
+unique(sample_data(ps.Final.Mucus)$Timepoint)
+unique(sample_data(ps.Final.Mucus)$Treatment)
+
+ps.Final.Mucus.clr <- microbiome::transform(ps.Final.Mucus, 'clr') #clr = centered log ratio
+ord.Final.Mucus.clr<- ordinate(ps.Final.Mucus.clr, "RDA", "euclidean", set.seed(18))
+
+plot_ordination(ps.Final.Mucus.clr, ord.Final.Mucus.clr , type="samples", color="Outplant_rack", shape = "Treatment") +
+  geom_point(size = 4) +
+  theme(text=element_text(size=14), panel.grid = element_blank()) +
+  labs(title = "All tissue samples")
+
+            #Test treatment (only DS, DD, SD, SS)
+            Permanova_metadata <- data.frame(sample_data(ps.Final.Mucus.clr))
+            perm <- adonis2(distance(ps.Final.Mucus.clr, method="euclidean") ~ Outplant_rack,
+                    data = Permanova_metadata,
+                    permutations = how(blocks = Permanova_metadata$Site))
+            perm
+
+            
+            rm(Permanova_metadata)
+            rm(perm)
+```
+
+
+##### Treatment without initials
+rm(list = setdiff(ls(), c("ps.filtered", "metadata")))
+```{r}
+#Tissue
+ps.Final.Tissue <- ps.filtered %>%
+  subset_samples(Sample_Type == "Tissue") %>% 
+    subset_samples(Timepoint == "Final") %>% 
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros
+
+#Check
+unique(sample_data(ps.Final.Tissue)$Sample_Type)
+unique(sample_data(ps.Final.Tissue)$Timepoint)
+unique(sample_data(ps.Final.Tissue)$Treatment)
+
+ps.Final.Tissue.clr <- microbiome::transform(ps.Final.Tissue, 'clr') #clr = centered log ratio
+ord.Final.Tissue.clr<- ordinate(ps.Final.Tissue.clr, "RDA", "euclidean", set.seed(18))
+
+plot_ordination(ps.Final.Tissue.clr, ord.Final.Tissue.clr , type="samples", color="Treatment", shape="Site") +
+  geom_point(size = 4) +
+  theme(text=element_text(size=14), panel.grid = element_blank()) +
+  labs(title = "All tissue samples") +
+  scale_color_manual(values = c("royalblue4","violetred", "steelblue2","plum3")) 
+
+
+plot_ordination(ps.Final.Tissue.clr, ord.Final.Tissue.clr , type="samples", color="Outplant_Depth_DS", shape="Origin_Depth_DS") +
+  geom_point(size = 4) +
+  theme(text=element_text(size=14), panel.grid = element_blank()) +
+  labs(title = "final tissue samples")
+plot_ordination(ps.Final.Tissue.clr, ord.Final.Tissue.clr , type="samples", color="Origin_Depth_DS") +
+  geom_point(size = 4) +
+  theme(text=element_text(size=14), panel.grid = element_blank()) +
+  labs(title = "final tissue samples")
+
+            #Test treatment (only DS, DD, SD, SS)
+            Permanova_metadata <- data.frame(sample_data(ps.Final.Tissue.clr))
+            perm <- adonis2(distance(ps.Final.Tissue.clr, method="euclidean") ~ Treatment / Outplant_rack,
+                    data = Permanova_metadata,
+                    permutations = how(blocks = Permanova_metadata$Site))
+            perm
+
+            
+            rm(Permanova_metadata)
+            rm(perm)
+            
+            #Test outplant depth
+            Permanova_metadata <- data.frame(sample_data(ps.Final.Tissue.clr))
+            perm <- adonis2(distance(ps.Final.Tissue.clr, method="euclidean") ~ Outplant_Depth_DS / Outplant_rack,
+                    data = Permanova_metadata,
+                    permutations = how(blocks = Permanova_metadata$Site))
+            perm
+ 
+            
+            rm(Permanova_metadata)
+            rm(perm)
+            
+            #Test origin depth
+            Permanova_metadata <- data.frame(sample_data(ps.Final.Tissue.clr))
+            perm <- adonis2(distance(ps.Final.Tissue.clr, method="euclidean") ~ Origin_Depth_DS / Outplant_rack,
+                    data = Permanova_metadata,
+                    permutations = how(blocks = Permanova_metadata$Site))
+            perm
+
+            
+            rm(Permanova_metadata)
+            rm(perm)
+```
+
+rm(list = setdiff(ls(), c("ps.filtered", "metadata")))
+```{r}
+#Mucus
+ps.Final.Mucus <- ps.filtered %>%
+  subset_samples(Sample_Type == "Mucus") %>% 
+  subset_samples(Timepoint == "Final") %>%
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zero
+
+
+ps.Final.Mucus.clr <- microbiome::transform(ps.Final.Mucus, 'clr') #clr = centered log ratio
+ord.Final.Mucus.clr <- ordinate(ps.Final.Mucus.clr, "RDA", "euclidean", set.seed(18))
+
+plot_ordination(ps.Final.Mucus.clr, ord.Final.Mucus.clr , type="samples", color="Treatment", shape="Site") +
+  geom_point(size = 4) +
+  theme(text=element_text(size=14), panel.grid = element_blank()) +
+  labs(title = "final mucus samples") +
+  scale_color_manual(values = c("royalblue4","violetred", "steelblue2","plum3")) 
+
+plot_ordination(ps.Final.Mucus.clr, ord.Final.Mucus.clr , type="samples", color="Outplant_Depth_DS", shape="Origin_Depth_DS") +
+  geom_point(size = 4) +
+  theme(text=element_text(size=14), panel.grid = element_blank()) +
+  labs(title = "final mucus samples")
+
+
+            #Test treatment (only DS, DD, SD, SS)
+            Permanova_metadata <- data.frame(sample_data(ps.Final.Mucus.clr))
+            perm <- adonis2(distance(ps.Final.Mucus.clr, method="euclidean") ~ Treatment / Outplant_rack,
+                    data = Permanova_metadata,
+                    permutations = how(blocks = Permanova_metadata$Site))
+            perm
+            
+            rm(Permanova_metadata)
+            rm(perm)
+            
+            #Test outplant depth
+            Permanova_metadata <- data.frame(sample_data(ps.Final.Mucus.clr))
+            perm <- adonis2(distance(ps.Final.Mucus.clr, method="euclidean") ~ Outplant_Depth_DS / Outplant_rack,
+                    data = Permanova_metadata,
+                    permutations = how(blocks = Permanova_metadata$Site))
+            perm
+
+            rm(Permanova_metadata)
+            rm(perm)
+            
+            #Test origin depth
+            Permanova_metadata <- data.frame(sample_data(ps.Final.Mucus.clr))
+            perm <- adonis2(distance(ps.Final.Mucus.clr, method="euclidean") ~ Origin_Depth_DS / Outplant_rack,
+                    data = Permanova_metadata,
+                    permutations = how(blocks = Permanova_metadata$Site))
+            perm
+
+            rm(Permanova_metadata)
+            rm(perm)
+
+```
+
+
+
+
+
+
+#Alpha diversity 
+rm(list = setdiff(ls(), c("ps.filtered", "metadata")))
+```{r}
+#Need counts, not relative abundance
+ps.NoControl_counts <- ps.filtered %>%
+  subset_samples(Sample_Type != "Control") %>% #remove controls
+  subset_samples(Sample_Type != "Mock") %>% #remove controls
+  subset_samples(Sample_Type != "Water") %>%
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros
+```
+
+
+```{r}
+allAlpha <- plot_richness(ps.NoControl_counts, x = "Treatment", measures = c("Observed","Chao1", "Shannon"))
+
+alpha_Data <- allAlpha$data 
+alpha_split <-split(alpha_Data, alpha_Data$variable)
+
+#Observed is richness
+alpha_Observed <- alpha_split$Observed
+alpha_Observed_tissue <- alpha_Observed %>% filter(Sample_Type == "Tissue")
+alpha_Observed_mucus <- alpha_Observed %>% filter(Sample_Type == "Mucus")
+```
+
+##### Tissue
+```{r}
+########################################################################
+# Tissue
+# Plot Observed (richness)
+
+ggplot(alpha_Observed_tissue, aes(x = Treatment, y = value, color = Treatment)) +
+   geom_jitter(width = 0.15, alpha = 0.6, size = 0.5) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    text = element_text(size = 14),
+    legend.position = "none") +
+  stat_summary(fun = mean, geom = "point", size = 3) +
+  stat_summary(
+    fun.min = function(x) mean(x) - sd(x),
+    fun.max = function(x) mean(x) + sd(x),
+    geom = "errorbar",
+    width = 0.1) +
+  labs(x = "Treatment", y = "Richness",
+       title = "Alpha diversity - Richness - Tissue") +
+  scale_color_manual(values = c("dodgerblue2", "dodgerblue4", "powderblue", "orchid2", "orchid4", "pink"))
+
+########################################################################
+
+#testing
+
+######## for observed
+lmer_mod <- lmer(value ~ Treatment + (1 | Outplant_rack), data = alpha_Observed_tissue)
+lmer_mod
+summary(lmer_mod)
+
+
+confint(lmer_mod)
+
+
+
+emm <- emmeans(lmer_mod, ~ Treatment)
+pairs(emm, adjust = "tukey")
+
+
+rm(lmer_mod)
+rm(emm)
+```
+
+
+
+##### Mucus
+rm(list = setdiff(ls(), c("ps.filtered", "metadata", "alpha_Observed_mucus")))
+```{r}
+########################################################################
+# Mucus
+# Plot Observed (richness)
+
+ggplot(alpha_Observed_mucus, aes(x = Treatment, y = value, color = Treatment)) +
+   geom_jitter(width = 0.15, alpha = 0.6, size = 0.5) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    text = element_text(size = 14),
+    legend.position = "none") +
+  stat_summary(fun = mean, geom = "point", size = 3) +
+  stat_summary(
+    fun.min = function(x) mean(x) - sd(x),
+    fun.max = function(x) mean(x) + sd(x),
+    geom = "errorbar",
+    width = 0.1) +
+  labs(x = "Treatment", y = "Richness",
+       title = "Alpha diversity - Richness - Mucus") +
+  scale_color_manual(values = c("dodgerblue2", "dodgerblue4", "powderblue", "orchid2", "orchid4", "pink"))
+
+
+########################################################################
+########################################################################
+
+#testing
+
+######## for observed
+lmer_mod <- lmer(value ~ Treatment + (1 | Outplant_rack), data = alpha_Observed_mucus)
+lmer_mod
+summary(lmer_mod)
+
+confint(lmer_mod)
+
+
+emm <- emmeans(lmer_mod, ~ Treatment)
+pairs(emm, adjust = "tukey")
+
+rm(lmer_mod)
+rm(emm)
+```
+
+
+
+#Beta diversity 
+useful resource on beta div types: https://docs.onecodex.com/en/articles/4150649-beta-diversity
+Code based on Anya's from Cleanerfish project 
+
+rm(list = setdiff(ls(), c("ps.filtered", "metadata")))
+
+##### Tissue
+```{r}
+#phyloseq with only tissue, all sample treatments, both sites, no controls
+ps.Tissue <- ps.filtered %>%
+  subset_samples(Sample_Type == "Tissue") %>% 
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros
+
+#Check
+unique(sample_data(ps.Tissue)$Sample_Type)
+
+ps.Tissue.clr <- microbiome::transform(ps.Tissue, 'clr') #clr = centered log ratio
+
+otu_clr <- as.data.frame(otu_table(ps.Tissue.clr)) #pull out OTU table, make sure sample names are rows
+metadat_clr <- as.data.frame(sample_data(ps.Tissue.clr)) #pull out Meta table
+#Check if my rows are in the same order
+identical(rownames(otu_clr), rownames(metadat_clr))
+    #True!
+
+
+Veg <- vegdist(otu_clr, method="euclidean") 
+
+
+Mod_BetaDisp <-betadisper(Veg, metadat_clr$Treatment)
+Mod_BetaDisp
+summary(Mod_BetaDisp)
+
+```
+
+
+```{r}
+##Prepare for plotting 
+
+dist.tab <- as.data.frame(Mod_BetaDisp$distances)
+dist.tab$Sample_names <- rownames(dist.tab)
+colnames(dist.tab)[1] <- "distance"
+
+identical(rownames(metadat_clr), dist.tab$Sample_names)
+    #TRUE
+
+dist.tab$Treatment <- metadat_clr$Treatment
+dist.tab$Outplant_rack <- metadat_clr$Outplant_rack
+dist.tab$Site <- metadat_clr$Site
+dist.tab$Coral_ID <- metadat_clr$Coral_ID
+dist.tab$Sample_Type <- metadat_clr$Sample_Type
+dist.tab
+
+
+ggplot(dist.tab, aes(x = Treatment, y = distance, color = Treatment)) +
+   geom_jitter(width = 0.15, alpha = 0.6, size = 0.5) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    text = element_text(size = 14),
+    legend.position = "none") +
+  stat_summary(fun = mean, geom = "point", size = 3) +
+  stat_summary(
+    fun.min = function(x) mean(x) - sd(x),
+    fun.max = function(x) mean(x) + sd(x),
+    geom = "errorbar",
+    width = 0.1) +
+  labs(x = "", y = "Distance to centroid",
+       title = "Beta diversity - Tissue") +
+  scale_color_manual(values = c("dodgerblue2", "dodgerblue4", "powderblue", "orchid2", "orchid4", "pink"))
+```
+
+
+```{r}
+#testing
+
+lmer_mod <- lmer(distance ~ Treatment + (1 | Outplant_rack), data = dist.tab)
+lmer_mod
+summary(lmer_mod)
+
+
+confint(lmer_mod)
+
+
+emm <- emmeans(lmer_mod, ~ Treatment)
+pairs(emm, adjust = "tukey")
+ 
+
+```
+
+
+
+##### Mucus
+rm(list = setdiff(ls(), c("ps.filtered", "metadata")))
+```{r}
+#phyloseq with only mucus, all sample treatments, both sites, no controls
+ps.Mucus <- ps.filtered %>%
+  subset_samples(Sample_Type == "Mucus") %>% 
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros
+
+#Check
+unique(sample_data(ps.Mucus)$Sample_Type)
+
+ps.Mucus.clr <- microbiome::transform(ps.Mucus, 'clr') #clr = centered log ratio
+
+
+otu_clr <- as.data.frame(otu_table(ps.Mucus.clr)) #pull out OTU table, make sure sample names are rows
+metadat_clr <- as.data.frame(sample_data(ps.Mucus.clr)) #pull out Meta table
+#Check if my rows are in the same order
+identical(rownames(otu_clr), rownames(metadat_clr))
+    #True!
+
+
+Veg <- vegdist(otu_clr, method="euclidean") 
+
+
+Mod_BetaDisp <-betadisper(Veg, metadat_clr$Treatment)
+Mod_BetaDisp
+summary(Mod_BetaDisp)
+
+```
+
+
+```{r}
+##Prepare for plotting 
+
+dist.tab <- as.data.frame(Mod_BetaDisp$distances)
+dist.tab$Sample_names <- rownames(dist.tab)
+colnames(dist.tab)[1] <- "distance"
+
+identical(rownames(metadat_clr), dist.tab$Sample_names)
+    #TRUE
+
+dist.tab$Treatment <- metadat_clr$Treatment
+dist.tab$Outplant_rack <- metadat_clr$Outplant_rack
+dist.tab$Site <- metadat_clr$Site
+dist.tab$Coral_ID <- metadat_clr$Coral_ID
+dist.tab$Sample_Type <- metadat_clr$Sample_Type
+dist.tab
+
+
+ggplot(dist.tab, aes(x = Treatment, y = distance, color = Treatment)) +
+   geom_jitter(width = 0.15, alpha = 0.6, size = 0.5) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    text = element_text(size = 14),
+    legend.position = "none") +
+  stat_summary(fun = mean, geom = "point", size = 3) +
+  stat_summary(
+    fun.min = function(x) mean(x) - sd(x),
+    fun.max = function(x) mean(x) + sd(x),
+    geom = "errorbar",
+    width = 0.1) +
+  labs(x = "", y = "Distance to centroid",
+       title = "Beta diversity - Mucus") +
+  scale_color_manual(values = c("dodgerblue2", "dodgerblue4", "powderblue", "orchid2", "orchid4", "pink"))
+```
+
+```{r}
+#testing
+
+lmer_mod <- lmer(distance ~ Treatment + (1 | Outplant_rack), data = dist.tab)
+lmer_mod
+summary(lmer_mod)
+
+confint(lmer_mod)
+
+emm <- emmeans(lmer_mod, ~ Treatment)
+pairs(emm, adjust = "tukey")
+
+```
+
+
+
+
+
+
+# 10% - All treatment bar plots
+##### Tissue
+
+```{r}
+rm(list = setdiff(ls(), c("ps.filtered", "metadata")))
+
+ps.AllTreat.Tissue <- ps.filtered %>%
+  subset_samples(Sample_Type == "Tissue") %>% 
+  filter_taxa(function(x) sum(x) > 0, TRUE) %>% #remove ASVS with all zeros
+  transform_sample_counts(function(x) x / sum(x) ) #this makes everything in relative abundances
+
+#Check that it's relative abundance
+otu_table(ps.AllTreat.Tissue)[1:3, 1:3]
+
+AllTreat_data <- psmelt(ps.AllTreat.Tissue)
+names(AllTreat_data)[1] <- "ASV"
+AllTreat_data$ASV_GenusSpecies <- paste(AllTreat_data$ASV, AllTreat_data$Genus, AllTreat_data$Species, sep = " ") # make a new variable with ASV, Genus, and Species
+AllTreat_data <- AllTreat_data[AllTreat_data$Abundance != 0, ] #remove if ASV abundance is zero
+
+#select genera that are >1% in any sample
+top_by_sample <- AllTreat_data %>%
+  filter(Abundance > 0.1) %>%
+  distinct(Genus)
+
+# Filter original long data to keep only those Treatment-specific top genera
+filtered_Genus <- AllTreat_data %>%
+  inner_join(top_by_sample %>% select(Genus),
+             by = c("Genus"))
+
+# How many genera per treatment did we keep?
+filtered_Genus %>%
+  dplyr::distinct(Treatment, Genus) %>%
+  dplyr::count(Treatment)
+# How many total genera?
+length(unique(filtered_Genus$Genus)) #27
+#Get the full unique taxonomy in decreasing abundance
+unique_taxonomy_ordered <- filtered_Genus %>%
+  group_by(Phylum, Class, Order, Family, Genus) %>%
+  summarise(Total_Abundance = sum(Abundance, na.rm = TRUE),
+            .groups = "drop") %>%
+  arrange(desc(Total_Abundance))
+
+# Set factor to genera are in order of decreasing abundance
+filtered_Genus$Genus <- factor(filtered_Genus$Genus,
+                                levels = unique_taxonomy_ordered$Genus)
+
+# write.csv(unique_taxonomy_ordered, "unique_taxonomy_ordered_Tissue.csv")
+
+#Get my color scheme
+unique_taxonomy_ordered_colors_tissue <- read.csv("unique_taxonomy_ordered_colors_tissue.csv")
+color_map <- setNames(unique_taxonomy_ordered_colors_tissue$Color, 
+                      unique_taxonomy_ordered_colors_tissue$Genus)
+
+Top10PercentGenre_AllTreat_Tissue <- ggplot(filtered_Genus, aes(x = Sample, y = Abundance, fill = Genus)) +
+  geom_bar(stat = "identity") + 
+  theme(panel.grid = element_blank(), 
+        text=element_text(size=20),
+        axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(size = 16),
+        legend.title=element_blank(),
+        legend.position = "bottom") +
+  labs(x = "", y = bquote("Relative abundance")) +
+  scale_fill_manual(values = color_map) +
+  facet_grid(~ Treatment, scales="free", space="free")
+
+Top10PercentGenre_AllTreat_Tissue +
+  theme(legend.position = "none")
+
+```
+
+
+##### Mucus
+```{r}
+rm(list = setdiff(ls(), c("ps.filtered", "metadata")))
+
+ps.AllTreat.Mucus <- ps.filtered %>%
+  subset_samples(Sample_Type == "Mucus") %>% 
+  filter_taxa(function(x) sum(x) > 0, TRUE) %>% #remove ASVS with all zeros
+  transform_sample_counts(function(x) x / sum(x) ) #this makes everything in relative abundances
+
+AllTreat_data <- psmelt(ps.AllTreat.Mucus)
+names(AllTreat_data)[1] <- "ASV"
+AllTreat_data$ASV_GenusSpecies <- paste(AllTreat_data$ASV, AllTreat_data$Genus, AllTreat_data$Species, sep = " ") # make a new variable with ASV, Family and Genus
+AllTreat_data <- AllTreat_data[AllTreat_data$Abundance != 0, ] #remove if ASV abundance is zero
+
+#select genera that are >1% in any sample
+top_by_sample <- AllTreat_data %>%
+  filter(Abundance > 0.1) %>%
+  distinct(Genus)
+
+# Filter original long data to keep only those Treatment-specific top genera
+filtered_Genus <- AllTreat_data %>%
+  inner_join(top_by_sample %>% select(Genus),
+             by = c("Genus"))
+
+# How many genera per treatment did we keep?
+filtered_Genus %>%
+  dplyr::distinct(Treatment, Genus) %>%
+  dplyr::count(Treatment)
+# How many total genera?
+length(unique(filtered_Genus$Genus)) #104
+#Get the full unique taxonomy in decreasing abundance
+unique_taxonomy_ordered <- filtered_Genus %>%
+  group_by(Phylum, Class, Order, Family, Genus) %>%
+  summarise(Total_Abundance = sum(Abundance, na.rm = TRUE),
+            .groups = "drop") %>%
+  arrange(desc(Total_Abundance))
+
+# Set factor to genera are in order of decreasing abundance
+filtered_Genus$Genus <- factor(filtered_Genus$Genus,
+                                levels = unique_taxonomy_ordered$Genus)
+
+#write.csv(unique_taxonomy_ordered, "unique_taxonomy_ordered_Mucus.csv")
+
+#Get my color scheme
+unique_taxonomy_ordered_colors_mucus <- read.csv("unique_taxonomy_ordered_colors_mucus.csv")
+color_map <- setNames(unique_taxonomy_ordered_colors_mucus$Color, 
+                      unique_taxonomy_ordered_colors_mucus$Genus)
+
+
+Top10Percent_AllTreat_Mucus <- ggplot(filtered_Genus, aes(x = Sample, y = Abundance, fill = Genus)) +
+  geom_bar(stat = "identity") + 
+  theme(panel.grid = element_blank(), 
+        text=element_text(size=20),
+        axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(size = 16),
+        legend.title=element_blank(),
+        legend.position = "bottom") +
+  labs(x = "", y = bquote("Relative abundance")) +
+  scale_fill_manual(values = color_map) +
+  facet_grid(~ Treatment, scales="free", space="free")
+
+Top10Percent_AllTreat_Mucus +
+  theme(legend.position = "none")
+
+```
+
+Mean and SD of relative abundances of genera
+```{r}
+
+Genus_Mean_byTreatment <- AllTreat_data %>% 
+                              inner_join(
+                                    top40_by_treatment %>% select(Treatment, Genus),
+                                    by = c("Treatment", "Genus")) %>%
+                              summarise(
+                                    AbundanceMean = mean(Abundance),
+                                    Abundance_SD  = sd(Abundance),
+                                    Abundance_Min = min(Abundance, na.rm = TRUE),
+                                    Abundance_Max = max(Abundance, na.rm = TRUE),
+                                    .by = c(Treatment, Genus))
+split_df <- split(Genus_Mean_byTreatment, Genus_Mean_byTreatment$Treatment)
+
+```
+
+
+# 40 - All treatment bar plots 
+##### Tissue
+
+```{r}
+rm(list = setdiff(ls(), c("ps.filtered", "metadata")))
+
+ps.AllTreat.Tissue <- ps.filtered %>%
+  subset_samples(Sample_Type == "Tissue") %>% 
+  filter_taxa(function(x) sum(x) > 0, TRUE) %>% #remove ASVS with all zeros
+  transform_sample_counts(function(x) x / sum(x) ) #this makes everything in relative abundances
+
+#Check that it's relative abundance
+otu_table(ps.AllTreat.Tissue)[1:3, 1:3]
+
+AllTreat_data <- psmelt(ps.AllTreat.Tissue)
+names(AllTreat_data)[1] <- "ASV"
+AllTreat_data$ASV_GenusSpecies <- paste(AllTreat_data$ASV, AllTreat_data$Genus, AllTreat_data$Species, sep = " ") # make a new variable with ASV, Genus, and Species
+AllTreat_data <- AllTreat_data[AllTreat_data$Abundance != 0, ] #remove if ASV abundance is zero
+
+# these steps ID the top 40 genre per treatment to plot:
+# Sum abundance within each Treatment x Genus, rank within Treatment, keep top 40
+top40_by_treatment <- AllTreat_data %>%
+  group_by(Treatment, Genus) %>%
+  summarise(AbundanceSum = sum(Abundance), .groups = "drop") %>%
+  group_by(Treatment) %>%
+  slice_max(order_by = AbundanceSum, n = 40, with_ties = FALSE) %>%
+  ungroup()
+
+# Filter original long data to keep only those Treatment-specific top genera
+filtered_Genus <- AllTreat_data %>%
+  inner_join(top40_by_treatment %>% select(Treatment, Genus),
+             by = c("Treatment", "Genus"))
+
+# How many genera per treatment did we keep?
+filtered_Genus %>%
+  distinct(Treatment, Genus) %>%
+  count(Treatment)
+# How many total genera?
+length(unique(filtered_Genus$Genus)) #77
+#Get the full unique taxonomy in decreasing abundance
+unique_taxonomy_ordered <- filtered_Genus %>%
+  group_by(Phylum, Class, Order, Family, Genus) %>%
+  summarise(Total_Abundance = sum(Abundance, na.rm = TRUE),
+            .groups = "drop") %>%
+  arrange(desc(Total_Abundance))
+
+# Set factor to genera are in order of decreasing abundance
+filtered_Genus$Genus <- factor(filtered_Genus$Genus,
+                                levels = unique_taxonomy_ordered$Genus)
+
+# write.csv(unique_taxonomy_ordered, "unique_taxonomy_ordered_Tissue.csv")
+
+#Get my color scheme
+unique_taxonomy_ordered_colors_tissue <- read_csv("unique_taxonomy_ordered_colors_tissue.csv")
+
+Top40Genre_AllTreat_Tissue <- ggplot(filtered_Genus, aes(x = Sample, y = Abundance, fill = Genus)) +
+  geom_bar(stat = "identity") + 
+  theme(panel.grid = element_blank(), 
+        text=element_text(size=20),
+        axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(size = 16),
+        legend.title=element_blank(),
+        legend.position = "bottom") +
+  labs(x = "", y = bquote("Relative abundance")) +
+  scale_fill_manual(values = unique_taxonomy_ordered_colors_tissue$Color) +
+  facet_grid(~ Treatment, scales="free", space="free")
+
+Top40Genre_AllTreat_Tissue +
+  theme(legend.position = "none")
+
+```
+
+Mean and SD of relative abundances of genera
+```{r}
+Genus_Mean_byTreatment <- AllTreat_data %>% 
+                              inner_join(
+                                    top40_by_treatment %>% select(Treatment, Genus),
+                                    by = c("Treatment", "Genus")) %>%
+                              summarise(
+                                    AbundanceMean = mean(Abundance),
+                                    Abundance_SD  = sd(Abundance),
+                                    Abundance_Min = min(Abundance, na.rm = TRUE),
+                                    Abundance_Max = max(Abundance, na.rm = TRUE),
+                                    .by = c(Treatment, Genus))
+split_df <- split(Genus_Mean_byTreatment, Genus_Mean_byTreatment$Treatment)
+```
+
+
+
+
+##### Mucus
+rm(list = setdiff(ls(), c("ps.filtered", "metadata")))
+```{r}
+ps.AllTreat.Mucus <- ps.filtered %>%
+  subset_samples(Sample_Type == "Mucus") %>% 
+  filter_taxa(function(x) sum(x) > 0, TRUE) %>% #remove ASVS with all zeros
+  transform_sample_counts(function(x) x / sum(x) ) #this makes everything in relative abundances
+
+AllTreat_data <- psmelt(ps.AllTreat.Mucus)
+names(AllTreat_data)[1] <- "ASV"
+AllTreat_data$ASV_GenusSpecies <- paste(AllTreat_data$ASV, AllTreat_data$Genus, AllTreat_data$Species, sep = " ") # make a new variable with ASV, Family and Genus
+AllTreat_data <- AllTreat_data[AllTreat_data$Abundance != 0, ] #remove if ASV abundance is zero
+
+# these steps ID the top 40 genre per treatment to plot:
+# Sum abundance within each Treatment x Genus, rank within Treatment, keep top 40
+top40_by_treatment <- AllTreat_data %>%
+  group_by(Treatment, Genus) %>%
+  summarise(AbundanceSum = sum(Abundance), .groups = "drop") %>%
+  group_by(Treatment) %>%
+  slice_max(order_by = AbundanceSum, n = 40, with_ties = FALSE) %>%
+  ungroup()
+
+# Filter original long data to keep only those Treatment-specific top genera
+filtered_Genus <- AllTreat_data %>%
+  inner_join(top40_by_treatment %>% select(Treatment, Genus),
+             by = c("Treatment", "Genus"))
+
+# How many genera per treatment did we keep?
+filtered_Genus %>%
+  distinct(Treatment, Genus) %>%
+  count(Treatment)
+# How many total genera?
+length(unique(filtered_Genus$Genus)) #104
+#Get the full unique taxonomy in decreasing abundance
+unique_taxonomy_ordered <- filtered_Genus %>%
+  group_by(Phylum, Class, Order, Family, Genus) %>%
+  summarise(Total_Abundance = sum(Abundance, na.rm = TRUE),
+            .groups = "drop") %>%
+  arrange(desc(Total_Abundance))
+
+# Set factor to genera are in order of decreasing abundance
+filtered_Genus$Genus <- factor(filtered_Genus$Genus,
+                                levels = unique_taxonomy_ordered$Genus)
+
+#write.csv(unique_taxonomy_ordered, "unique_taxonomy_ordered_Mucus.csv")
+
+#Get my color scheme
+unique_taxonomy_ordered_colors_mucus <- read_csv("unique_taxonomy_ordered_colors_mucus.csv")
+
+
+Top40Genre_AllTreat_Mucus <- ggplot(filtered_Genus, aes(x = Sample, y = Abundance, fill = Genus)) +
+  geom_bar(stat = "identity") + 
+  theme(panel.grid = element_blank(), 
+        text=element_text(size=20),
+        axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(size = 16),
+        legend.title=element_blank(),
+        legend.position = "bottom") +
+  labs(x = "", y = bquote("Relative abundance")) +
+  scale_fill_manual(values = unique_taxonomy_ordered_colors_mucus$Colors) +
+  facet_grid(~ Treatment, scales="free", space="free")
+
+Top40Genre_AllTreat_Mucus +
+  theme(legend.position = "none")
+
+```
+
+Mean and SD of relative abundances of genera
+```{r}
+
+Genus_Mean_byTreatment <- AllTreat_data %>% 
+                              inner_join(
+                                    top40_by_treatment %>% select(Treatment, Genus),
+                                    by = c("Treatment", "Genus")) %>%
+                              summarise(
+                                    AbundanceMean = mean(Abundance),
+                                    Abundance_SD  = sd(Abundance),
+                                    Abundance_Min = min(Abundance, na.rm = TRUE),
+                                    Abundance_Max = max(Abundance, na.rm = TRUE),
+                                    .by = c(Treatment, Genus))
+split_df <- split(Genus_Mean_byTreatment, Genus_Mean_byTreatment$Treatment)
+
+```
+
+
+#Differential abundance
+Corncob method
+
+##### Initial Tissue
+rm(list = setdiff(ls(), c("ps.filtered")))
+```{r}
+#Corncob wants count data, not relative abundance.
+
+#phyloseq object with count data, not relative abundance
+
+ps.endo <- ps.filtered %>%
+           subset_samples(Sample_Type == "Tissue") %>% 
+           subset_samples(Timepoint == "Initial") %>% 
+           subset_taxa(grepl("Endozoicomonas", Genus) & !grepl("Kistimonas", Genus)) %>% 
+           filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros 
+
+#Double check that this is count data
+otu_table(ps.endo)[1:3, 1:3]
+#Double check that this is just Endozoicomonas
+tax_table(ps.endo)[, "Genus"]
+
+# Make factors
+sample_data(ps.endo)$Treatment <-   factor(sample_data(ps.endo)$Treatment,levels=c("D0", "S0"))
+
+# Corncob: Differential abundance test 
+set.seed(1)
+DA.Initial_Tissue <- differentialTest(formula = ~ Treatment + Site, 
+                             phi.formula = ~ Treatment + Site,
+                             formula_null = ~  + Site,
+                             phi.formula_null = ~ Treatment + Site,
+                             test = "Wald", boot = FALSE,
+                             data = ps.endo,
+                             fdr_cutoff = 0.05)
+DA.Initial_Tissue$significant_taxa # "ASV1"   "ASV122" "ASV464"
+length(DA.Initial_Tissue$significant_taxa) #3
+DA.Initial_Tissue$significant_models
+
+#make a df of the corncob output and the taxonomy
+#This is from Cynthia's published code: https://github.com/CynthiaBecker/SCTLD-STT/blob/main/Code_to_Reproduce_Figures_in_Manuscript.Rmd
+#Write a function to extract the significant taxa and put it in a dataframe with a for loop so you can rearrange the levels of the taxa to make a nice ordered graph. 
+
+sigtaxto_df <- function(daout, psobj) {
+  df.out <- c()
+  for (i in 1:length(daout$significant_models)) { #from 1 to the number of significant taxa
+  df.out = rbind(df.out, daout$significant_models[[i]]$coefficients[2, 1:4]) #bind the sig.mcav row with coefficient, std. error, t value, Pr thing. coefficients[2,] is the DA model output.
+  }
+  asv = as.vector(daout$significant_taxa) #get significant ASVs
+  Class = as.vector(otu_to_taxonomy(data = psobj, daout$significant_taxa, level = c("Class"))) #isolate class of significant Asvs
+  Order = as.vector(otu_to_taxonomy(data = psobj, daout$significant_taxa, level = c("Order"))) #isolate order of significant ASVs
+  Family = as.vector(otu_to_taxonomy(data = psobj, daout$significant_taxa, level = c("Family"))) #isolate family of significant ASVs
+  Family.fix = ifelse(Family == "", "unclassified", Family) #replace empty values with "unclassified"
+  Genus = as.vector(otu_to_taxonomy(data = psobj, daout$significant_taxa, level = c("Genus"))) #isolate Genus of singnificant ASVs
+  Genus.fix = ifelse(Genus == "", "unclassified", Genus) #replace empty values with "unclassified"
+  
+  df.bind <- as.data.frame(cbind(df.out, asv, Class, Order, Family.fix, Genus.fix)) #bind taxonomic info together, making sure to use the vectors with "unclassified"
+  df.bind$asvgenus <- paste0(df.bind$Genus.fix, " (", df.bind$asv, ")") #make a concatenated column of ASV and Genus.
+  colnames(df.bind) <- c("Estimate", "StdError", "tvalue", "Pr", "asv", "Class", "Order", "Family", "Genus", "asvtaxa")
+  df.bind$Estimate = as.numeric(as.character(df.bind$Estimate)) #estimate column should be numeric 
+  df.bind$StdError = as.numeric(as.character(df.bind$StdError)) #stderror column should be numeric 
+  
+  return(df.bind)
+}
+
+Taxa.forgraph <- sigtaxto_df(DA.Initial_Tissue, ps.endo) 
+#write.csv(Taxa.forgraph, "DATaxa_Initial_Tissue.csv")
+
+ggplot(Taxa.forgraph, aes(x = asvtaxa, y = Estimate)) +
+  geom_errorbar(aes(ymin = Estimate-StdError, ymax = Estimate+StdError), color = "black", width = .3, position=position_dodge(.9)) +
+  geom_point(size = 4, pch = 21, color="black", fill="black") + 
+  scale_x_discrete(limits = rev(levels(Taxa.forgraph$asvtaxa))) +
+  geom_line() +
+  coord_flip() +
+  theme_bw() +
+  labs(x = "Taxa", y = "Coefficient", title = expression(italic("S0 vs D0"))) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "darkgray")
+```
+
+##### DD to DS Tissue
+rm(list = setdiff(ls(), c("ps.filtered")))
+```{r}
+#Corncob wants count data, not relative abundance.
+#phyloseq object with count data, not relative abundance
+
+ps.endo <- ps.filtered %>%
+           subset_samples(Sample_Type == "Tissue") %>% 
+           subset_samples(Timepoint == "Final") %>% 
+           subset_samples(Origin_Depth_DS == "D") %>%
+           subset_taxa(grepl("Endozoicomonas", Genus) & !grepl("Kistimonas", Genus)) %>% 
+           filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros 
+
+#Double check
+unique(sample_data(ps.endo)$Treatment)
+unique(sample_data(ps.endo)$Sample_Type)
+#Double check that this is count data
+otu_table(ps.endo)[1:3, 1:3]
+
+# Make factors
+sample_data(ps.endo)$Treatment <- factor(sample_data(ps.endo)$Treatment,levels=c("DD", "DS"))
+
+# Corncob: Differential abundance test 
+set.seed(1)
+DA.DD_DS_Tissue <- differentialTest(formula = ~ Treatment + Site, 
+                             phi.formula = ~ Treatment + Site,
+                             formula_null = ~  + Site,
+                             phi.formula_null = ~ Treatment + Site,
+                             test = "Wald", boot = FALSE,
+                             data = ps.endo,
+                             fdr_cutoff = 0.1)
+DA.DD_DS_Tissue$significant_taxa
+length(DA.DD_DS_Tissue$significant_taxa) #0
+
+```
+
+
+
+
+##### SS to SD Tissue
+rm(list = setdiff(ls(), c("ps.filtered")))
+```{r}
+#Corncob wants count data, not relative abundance.
+#phyloseq object with count data, not relative abundance
+ps.endo <- ps.filtered %>%
+           subset_samples(Sample_Type == "Tissue") %>% 
+           subset_samples(Timepoint == "Final") %>% 
+           subset_samples(Origin_Depth_DS == "S") %>%
+           subset_taxa(grepl("Endozoicomonas", Genus) & !grepl("Kistimonas", Genus)) %>% 
+           filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros 
+
+
+#check out the meta data of this phyloseq object to double check that I have the samples I want in it
+meta_temp <- sample_data(ps.endo)
+rm(meta_temp)
+unique(sample_data(ps.endo)$Treatment)
+unique(sample_data(ps.endo)$Sample_Type)
+#Double check that this is count data
+otu_table(ps.endo)[1:3, 1:3]
+
+# Make factors
+sample_data(ps.endo)$Treatment <- factor(sample_data(ps.endo)$Treatment,levels=c("SS", "SD"))
+
+# Corncob: Differential abundance test 
+set.seed(1)
+DA.SS_SD_Tissue <- differentialTest(formula = ~ Treatment + Site, 
+                             phi.formula = ~ Treatment + Site,
+                             formula_null = ~  + Site,
+                             phi.formula_null = ~ Treatment + Site,
+                             test = "Wald", boot = FALSE,
+                             data = ps.endo,
+                             fdr_cutoff = 0.1)
+DA.SS_SD_Tissue$significant_taxa
+length(DA.SS_SD_Tissue$significant_taxa) #0
+
+```
+
+
+
+
+
+
+
+
+
+
+#Just Endo qPCR
+
+Did some excel calculations with these outputs, which can be found in: 
+~/Documents/WHOI/Projects/LittleCaymanTransplant/Data_Analyses/qPCR_differences.xlsx
+
+rm(list = setdiff(ls(), c("ps.filtered", "metadata")))
+```{r}
+qPCR_tissue <- metadata %>%
+  filter(Sample_Type == "Tissue")  %>%
+  mutate(Treatment = factor(Treatment,
+                  levels = c("S0",
+                             "SS",
+                             "SD",
+                             "D0",
+                             "DD", 
+                             "DS")))
+
+
+hist(qPCR_tissue$Endo_Avg_Quantity)
+
+qPCR_tissue$Norm_Copies <- qPCR_tissue$Endo_Avg_Quantity/qPCR_tissue$DNA_Concentration
+hist(qPCR_tissue$Norm_Copies)
+
+qPCR_tissue$Log10_Copies <- log10(qPCR_tissue$Norm_Copies)      # remember in R that log() = natural log (base e)
+hist(qPCR_tissue$Log10_Copies)
+
+boxplot(qPCR_tissue$DNA_Concentration ~ qPCR_tissue$Unique_ID)
+boxplot(qPCR_tissue$All_16S_Avg_Quantity ~ qPCR_tissue$Unique_ID, ylim = c(0,4000000))
+boxplot(qPCR_tissue$Endo_Avg_Quantity/qPCR_tissue$All_16S_Avg_Quantity ~ qPCR_tissue$Unique_ID)
+boxplot(qPCR_tissue$Endo_Avg_Quantity/qPCR_tissue$DNA_Concentration ~ qPCR_tissue$Unique_ID)
+```
+
+```{r}
+# Plot mean ± SD
+#summarize Abundance by Treatment
+
+qPCR_summary_bothsite <- qPCR_tissue %>%
+  filter(Sample_Type == "Tissue") %>%
+  group_by(Treatment) %>%
+  summarize(
+    mean_LOGabundance = mean(Log10_Copies, na.rm = TRUE),
+    sd_LOGabundance = sd(Log10_Copies, na.rm = TRUE),
+    mean_NORMabundance = mean(Norm_Copies, na.rm = TRUE),
+    sd_NORMabundance = sd(Norm_Copies, na.rm = TRUE),
+    .groups = "drop")
+```
+
+
+
+```{r}
+# testing
+aov_mod <- aov(Log10_Copies ~ Treatment * Site, data = qPCR_tissue)
+summary(aov_mod)
+  
+tk <- TukeyHSD(aov_mod)
+tk
+
+
+#get letters for plotting
+let <- multcompLetters4(aov_mod, tk)
+# extract as data frame (assumes the factor in aov_mod is Treatment)
+cld <- data.frame(
+  Treatment = names(let$Treatment$Letters),
+  Letters   = let$Treatment$Letters,
+  stringsAsFactors = FALSE
+)
+
+#Easy to add these numbers with illustrator later
+
+```
+
+
+plotting means and SD
+```{r}
+ggplot() +
+   geom_jitter(data =  qPCR_tissue,  aes(x = Treatment, y = Log10_Copies),  
+     width = 0.15, alpha = 0.6, size = 4,  color = "black") +
+  geom_errorbar(data =  qPCR_summary_bothsite, 
+                aes(x = Treatment, 
+                    ymin = mean_LOGabundance - sd_LOGabundance,
+                    ymax = mean_LOGabundance + sd_LOGabundance),
+                width = 0.2) +
+  geom_point(data =  qPCR_summary_bothsite,  aes(x = Treatment, y = mean_LOGabundance, fill = Treatment),
+    shape = 22, size = 11, color = "black") +
+  ylim(0,4) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    text = element_text(size = 14),
+    legend.position = "none"
+  ) +
+  labs(x = "Treatment", y = "Quantity (log[copies/ng])",
+       title = "Endozoicomonas absolute abundance (mean ± SD)") +
+  scale_fill_manual(values = c("orchid2", "pink", "orchid4", "dodgerblue2", "dodgerblue4", "powderblue"))
+
+
+
+```
+
+
+
+```{r}
+# plot treatment differences
+
+# I need to do this, because some corals have two of the same treatment, because CC Shallow corals didn't get properly crossed. Both halves went  to the same depth. 
+df_clean <- qPCR_tissue %>%
+  group_by(Coral_ID, Treatment, Site, Sample_Type) %>%
+  summarise(Log10_Copies = mean(Log10_Copies), .groups = "drop")
+
+
+df_wide <- df_clean %>%
+  select(Coral_ID, Treatment, Log10_Copies, Site, Sample_Type) %>%
+  pivot_wider(
+    names_from  = Treatment,
+    values_from = Log10_Copies)
+
+df_diff <- df_wide %>%
+  mutate(DS_minus_D0 = DS - D0,
+         DD_minus_D0 = DD - D0,
+         SD_minus_S0 = SD - S0,
+         SS_minus_S0 = SS - S0) %>%
+  select(Coral_ID, Site, Sample_Type, DS_minus_D0, DD_minus_D0, SD_minus_S0, SS_minus_S0)
+
+diff_long <- df_diff %>%
+  pivot_longer(
+    cols = -c(Coral_ID, Site, Sample_Type),      # columns to keep
+    names_to = "Treatment",       # new column containing the names
+    values_to = "difference_in_Log10Endo"       # new column containing the values
+  )
+
+diff_SDandDS <- diff_long %>%
+                 filter(Treatment %in% c("DS_minus_D0", "SD_minus_S0"))
+
+ggplot(diff_SDandDS, aes(x = Treatment, y = Coral_ID, fill = difference_in_Log10Endo)) +
+  geom_tile() +
+  scale_fill_viridis_c() +
+  theme_minimal() +
+  scale_fill_gradient2(
+    low = "red",        # negative values
+    mid = "white",      # zero
+    high = "blue",      # positive values
+    midpoint = 0        # center of the scale
+  ) 
+
+
+
+```
+
+```{r}
+# testing
+
+aov_mod <- aov(difference_in_Log10Endo ~ Treatment * Site, data = diff_long)
+summary(aov_mod)
+
+TukeyHSD(aov_mod)
+
+diff_means <- diff_SDandDS %>%
+      group_by(Treatment) %>%
+      summarize(
+        mean_abundance = mean(difference_in_Log10Endo, na.rm = TRUE),
+        sd_abundance = sd(difference_in_Log10Endo, na.rm = TRUE),
+        .groups = "drop")
+
+
+```
+
+
+#Water analyses
+rm(list = setdiff(ls(), c("ps.filtered", "metadata")))
+
+####PCoA
+```{r}
+#Phyloseq objects with counts so that I can centered log ratio transform them
+
+#All samples
+ps.Water_count <- ps.filtered %>%
+  subset_samples(Sample_Type == "Water") %>%
+  filter_taxa(function(x) sum(x) > 0, TRUE) #remove ASVS with all zeros
+
+#Classify the 20 m samples as shallow 
+sample_data(ps.Water_count)$Origin_Depth_DS[sample_data(ps.Water_count)$Origin_Depth_DS == "M"] <- "S"
+# Check that it worked
+unique(sample_data(ps.Water_count)$Origin_Depth_DS)
+
+# transform the data
+ps.Water.clr <- microbiome::transform(ps.Water_count, 'clr') #clr = centered log ratio
+ord.Water.clr <- ordinate(ps.Water.clr, "RDA", "euclidean", set.seed(18))
+
+#Site
+plot_ordination(ps.Water.clr, ord.Water.clr , type="samples", color="Site") +
+  geom_point(size = 4) +
+  theme(text=element_text(size=14), panel.grid = element_blank()) 
+  #geom_text_repel(aes(label=Unique_ID),hjust=0, vjust=0)
+
+            Permanova_metadata <- data.frame(sample_data(ps.Water.clr))
+            perm <- adonis2(distance(ps.Water.clr, method="euclidean") ~ Site,
+                    data = Permanova_metadata)
+            perm
+  
+            rm(Permanova_metadata)
+            rm(perm)
+            
+  #Timepoint
+  plot_ordination(ps.Water.clr, ord.Water.clr , type="samples", color="Timepoint") +
+  geom_point(size = 4) +
+  theme(text=element_text(size=14), panel.grid = element_blank()) +
+  scale_color_manual(values = c("mediumpurple2","orange2"))        
+            
+            Permanova_metadata <- data.frame(sample_data(ps.Water.clr))
+            perm <- adonis2(distance(ps.Water.clr, method="euclidean") ~ Timepoint,
+                              data = Permanova_metadata)
+            perm
+  
+            rm(Permanova_metadata)
+            rm(perm)
+            
+#Depth
+  plot_ordination(ps.Water.clr, ord.Water.clr , type="samples", color="Origin_Depth_DS") +
+  geom_point(size = 4) +
+  theme(text=element_text(size=14), panel.grid = element_blank())      
+  
+            Permanova_metadata <- data.frame(sample_data(ps.Water.clr))
+            perm <- adonis2(distance(ps.Water.clr, method="euclidean") ~ Origin_Depth_DS,
+                    data = Permanova_metadata,
+                    permutations = how(blocks = Permanova_metadata$Timepoint))
+            perm
+      
+            rm(Permanova_metadata)
+            rm(perm)
+            
+#Depth removing outliers            
+samples_to_remove <- c("Water_F_5", "Water_F_6")
+ps.Water.clr_nooutlier <- prune_samples(!(sample_names(ps.Water.clr) %in% samples_to_remove), ps.Water.clr)   
+            
+            Permanova_metadata <- data.frame(sample_data(ps.Water.clr_nooutlier))
+            perm <- adonis2(distance(ps.Water.clr_nooutlier, method="euclidean") ~ Origin_Depth_DS,
+                    data = Permanova_metadata)
+            perm
+         
+            rm(Permanova_metadata)
+            rm(perm)
+            
+```
+
+
+####Bar plots
+```{r}
+ps.Water <- ps.filtered %>%
+  subset_samples(Sample_Type == "Water") %>% 
+  filter_taxa(function(x) sum(x) > 0, TRUE) %>% #remove ASVS with all zeros
+  transform_sample_counts(function(x) x / sum(x)) #this makes everything in relative abundances
+```
+
+
+```{r}
+Water_data <- psmelt(ps.Water)
+names(Water_data)[1] <- "ASV"
+Water_data$ASV_GenusSpecies <- paste(Water_data$ASV, Water_data$Genus, Water_data$Species, sep = " ") # make a new variable with ASV, Family and Genus
+Water_data <- Water_data[Water_data$Abundance != 0, ] #remove if ASV abundance is zero
+
+# these steps ID the top 40 genre to plot
+Genus_Sums <- Water_data %>%
+                  group_by(Genus) %>%
+                  summarise(AbundanceSum = sum(Abundance))
+sorted_samples <- Genus_Sums[order(Genus_Sums$AbundanceSum, decreasing = TRUE),]
+head(sorted_samples)
+sorted_samples_40 <- sorted_samples$Genus[1:40]
+
+#now I want to plot those genre for each treatment
+filtered_Genus <- Water_data %>%
+  filter(Genus %in% sorted_samples_40)
+length(unique(filtered_Genus$Genus)) #40
+
+#Get the full unique taxonomy in decreasing abundance
+unique_taxonomy_ordered <- filtered_Genus %>%
+  group_by(Phylum, Class, Order, Family, Genus) %>%
+  summarise(Total_Abundance = sum(Abundance, na.rm = TRUE),
+            .groups = "drop") %>%
+  arrange(desc(Total_Abundance))
+
+#write.csv(unique_taxonomy_ordered, "unique_taxonomy_ordered_Water.csv")
+
+# Set factor to genera are in order of decreasing abundance
+filtered_Genus$Genus <- factor(filtered_Genus$Genus,
+                                levels = unique_taxonomy_ordered$Genus)
+
+library(randomcoloR)
+nColor <- 40
+myColor <- randomcoloR::distinctColorPalette(k = 40)
+pie(rep(1, nColor), col = myColor)
+
+#Classify the 20 m samples as shallow 
+filtered_Genus$Origin_Depth_DS[filtered_Genus$Origin_Depth_DS == "M"] <- "S"
+unique(filtered_Genus$Origin_Depth_DS)
+
+#Get the samples in order of site
+filtered_Genus <- filtered_Genus %>%
+  mutate(
+    Site = factor(Site,
+                  levels = c("Marthas_Finyard",
+                             "Coral_City",
+                             "Randys_Gazebo",
+                             "Dynamite_Drop",
+                             "Black_Hole"))
+  ) %>%
+  arrange(Site, Sample) %>%
+  mutate(Sample = factor(Sample, levels = unique(Sample)))
+
+Top40Genre_water <- ggplot(filtered_Genus, aes(x = Sample, y = Abundance, fill = Genus)) +
+  geom_bar(stat = "identity") +
+  theme(panel.grid = element_blank(),
+        text=element_text(size=20),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_text(size = 16),
+        legend.title=element_blank(),
+        legend.position = "bottom") +
+  labs(x = "", y = bquote("Relative abundance")) +
+  scale_fill_manual(values = myColor) +
+  facet_grid( ~ Origin_Depth_DS, scales="free", space="free")
+
+Top40Genre_water + 
+   theme(legend.position = "")
+
+
+```
+
+
+#### qPCR Endo
+rm(list = setdiff(ls(), c("ps.filtered", "metadata")))
+```{r}
+qPCR_Water <- metadata %>%
+  filter(Sample_Type == "Water") %>%
+  filter(Site %in% c("Coral_City", "Marthas_Finyard")) %>%
+  mutate(Treatment = factor(Treatment,
+                  levels = c("S",
+                             "D")))
+unique(qPCR_Water$Sample_Type)
+unique(qPCR_Water$Site)
+
+qPCR_Water$Norm_Copies <- qPCR_Water$Endo_Avg_Quantity/qPCR_Water$DNA_Concentration
+qPCR_Water$Log10_Copies <- log10(qPCR_Water$Norm_Copies)      # remember in R that log() = natural log (base e)
+```
+
+
+```{r}
+# Plot mean ± SD
+
+#Make the samples collected at 20 m as S
+qPCR_Water$Origin_Depth_DS[qPCR_Water$Origin_Depth_DS == "M"] <- "S"
+unique(qPCR_Water$Origin_Depth_DS)
+
+#summarize Abundance by depth
+qPCR_Water_summary <- qPCR_Water %>%
+  group_by(Origin_Depth_DS) %>%
+  summarize(
+    mean_LOGabundance = mean(Log10_Copies, na.rm = TRUE),
+    sd_LOGabundance = sd(Log10_Copies, na.rm = TRUE),
+    mean_NORMabundance = mean(Norm_Copies, na.rm = TRUE),
+    sd_NORMabundance = sd(Norm_Copies, na.rm = TRUE),
+    .groups = "drop")
+
+
+```
+
+
+```{r}
+# testing
+aov_mod <- aov(Log10_Copies ~ Origin_Depth_DS * Site, data = qPCR_Water)
+summary(aov_mod)
+    
+
+```
+
+
+```{r}
+ggplot() +
+   geom_jitter(data =  qPCR_Water,  aes(x = Origin_Depth_DS, y = Log10_Copies),  
+     width = 0.15, alpha = 0.6, size = 4,  color = "black") +
+  geom_errorbar(data =  qPCR_Water_summary, 
+                aes(x = Origin_Depth_DS, 
+                    ymin = mean_LOGabundance - sd_LOGabundance,
+                    ymax = mean_LOGabundance + sd_LOGabundance),
+                width = 0.2) +
+  geom_point(data =  qPCR_Water_summary,  aes(x = Origin_Depth_DS, y = mean_LOGabundance, fill = Origin_Depth_DS),
+    shape = 22, size = 11, color = "black") +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    text = element_text(size = 14),
+    legend.position = "none"
+  ) +
+  ylim(0,4) +
+  labs(x = "Treatment", y = "Quantity (log[copies/ng])",
+       title = "Endozoicomonas absolute abundance (mean ± SD)") +
+  scale_fill_manual(values = c("dodgerblue2", "orchid2"))
+```
+
+
+

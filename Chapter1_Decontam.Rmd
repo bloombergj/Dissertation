@@ -1,0 +1,123 @@
+---
+title: "Chapter1_Decontam"
+author: "JeanneBloomberg"
+date: "2025-07-30"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+# Load data
+
+```{r}
+library(decontam); packageVersion("decontam") #using version 1.29.0
+library(ggplot2); packageVersion("ggplot2")
+library("readr")
+library(phyloseq); packageVersion("phyloseq") # using ‘1.53.0’
+
+```
+
+```{r}
+setwd("~/Documents/WHOI/Projects/LittleCaymanTransplant_Analyses")
+```
+
+```{r}
+load("otus_LCT_AllSamples_final.RData")
+ASV <- as.matrix(otus)
+
+taxa <- as.matrix(read.table("taxonomy_LCT_AllSamples_final.txt", sep = "\t", row.names = 1, header = TRUE))
+
+ASV_ID <-read.table("ASVsequences_LCT_AllSamples_final.txt", sep = "\t", row.names = 1, header = TRUE)
+
+metadata <- read.csv("Meta_Data.csv", header = TRUE)
+rownames(metadata) <- metadata$sample_names
+```
+
+```{r}
+#How many negative controls are there?
+sum(metadata$Sample_Type == "Control") 
+#33
+```
+
+#Phyloseq object
+
+```{r}
+ASV = otu_table(ASV, taxa_are_rows = FALSE)
+TAX = tax_table(taxa)
+META = sample_data(metadata)
+
+ps <- phyloseq(ASV, TAX, META)
+```
+
+#Inspect library size
+
+```{r}
+df <- as.data.frame(sample_data(ps)) # Put sample_data into a ggplot-friendly data.frame
+df$LibrarySize <- sample_sums(ps)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=Sample_Type)) + geom_point()
+```
+The negative control samples have fewer reads as expected.
+
+
+
+
+
+
+#Run decontam
+```{r}
+#identify the negative controls as TRUE in is.neg
+sample_data(ps)$is.neg <- sample_data(ps)$Sample_Type == "Control"
+
+#change non-detected from 0 to 0.001 because decontam requires a number that is not zero
+sample_data(ps)$PCR_Concentration[sample_data(ps)$PCR_Concentration == 0] <- 0.001
+
+#run decontam with default threshold (0.1)
+contam <- isContaminant(ps, 
+                        method="combined", 
+                        neg="is.neg", 
+                        conc="PCR_Concentration")
+save(contam, file="contam.RData")
+```
+
+#Inspect contaminants:
+
+```{r}
+table(contam$contaminant)
+
+contam_list <- which(contam$contaminant)
+contam_list <- paste0("ASV", contam_list)
+
+contam_taxa <- taxa[rownames(taxa) %in% contam_list, ]
+
+write.csv(contam_taxa, file = "contaminant_taxa.csv")
+
+```
+
+#Histogram 
+```{r}
+histo <- ggplot(data=contam, aes(x=p)) + 
+  labs(x = 'decontam-prevalence Score', y='Number of ASVs') + 
+  geom_histogram(binwidth=0.02)
+histo
+
+
+### Add a column with binned prevalances
+contam$Prevalence_Binned <- cut(contam$prev, c(0, 10, 25, 45, 19999), labels=c("1-10", "11-25", "26-45", "45+"))
+histo <- ggplot(data=contam, aes(x=p)) + 
+  labs(x = 'decontam-prevalence Score', y='Number of ASVs') + 
+  geom_histogram(binwidth=0.02)
+histo + facet_wrap(~Prevalence_Binned)
+
+
+```
+
+
+
+#Scatter plot
+Here we are plotting 2 non-contaminants (ASV 1 and ASV 2) and 6 of the identified contaminants
+```{r}
+plot_frequency(ps, taxa_names(ps)[c(1, 2, 135, 671, 963, 1330, 2008, 2213)], conc="PCR_Concentration") + 
+  xlab("DNA Concentration (ng/µL)")
+```
